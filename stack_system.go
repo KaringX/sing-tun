@@ -16,7 +16,7 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/common/udpnat2"
+	udpnat "github.com/sagernet/sing/common/udpnat2"
 )
 
 var ErrIncludeAllNetworks = E.New("`system` and `mixed` stack are not available when `includeAllNetworks` is enabled. See https://github.com/SagerNet/sing-tun/issues/25")
@@ -340,6 +340,11 @@ func (s *System) processIPv6(ipHdr header.IPv6) (writeBack bool, err error) {
 }
 
 func (s *System) processIPv4TCP(ipHdr header.IPv4, tcpHdr header.TCP) (bool, error) {
+	if winTun, isWinTun := s.tun.(WinTun); isWinTun { //karing
+		if winTun.IsClosed() {
+			return false, net.ErrClosed
+		}
+	}
 	source := netip.AddrPortFrom(ipHdr.SourceAddr(), tcpHdr.SourcePort())
 	destination := netip.AddrPortFrom(ipHdr.DestinationAddr(), tcpHdr.DestinationPort())
 	if !destination.Addr().IsGlobalUnicast() {
@@ -427,6 +432,11 @@ func (s *System) resetIPv4TCP(origIPHdr header.IPv4, origTCPHdr header.TCP) erro
 }
 
 func (s *System) processIPv6TCP(ipHdr header.IPv6, tcpHdr header.TCP) (bool, error) {
+	if winTun, isWinTun := s.tun.(WinTun); isWinTun { //karing
+		if winTun.IsClosed() {
+			return false, net.ErrClosed
+		}
+	}
 	source := netip.AddrPortFrom(ipHdr.SourceAddr(), tcpHdr.SourcePort())
 	destination := netip.AddrPortFrom(ipHdr.DestinationAddr(), tcpHdr.DestinationPort())
 	if !destination.Addr().IsGlobalUnicast() {

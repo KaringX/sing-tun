@@ -539,6 +539,10 @@ func (t *NativeTun) Close() error {
 	return err
 }
 
+func (t *NativeTun) IsClosed() bool { //karing
+	return t.close.Load() == 1
+}
+
 func (t *NativeTun) UpdateRouteOptions(tunOptions Options) error {
 	t.options = tunOptions
 	if !t.options.AutoRoute {

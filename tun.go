@@ -33,6 +33,7 @@ type Tun interface {
 
 type WinTun interface {
 	Tun
+	IsClosed() bool //karing
 	ReadPacket() ([]byte, func(), error)
 }
 
