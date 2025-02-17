@@ -44,7 +44,7 @@ func New(options Options) (WinTun, error) {
 	}
 	adapter, err := wintun.CreateAdapter(options.Name, TunnelType, generateGUIDByDeviceName(options.Name))
 	if err != nil {
-		return nil, err
+		return nil, E.Cause(err, "create") //karing
 	}
 	nativeTun := &NativeTun{
 		adapter: adapter,
@@ -52,7 +52,7 @@ func New(options Options) (WinTun, error) {
 	}
 	session, err := adapter.StartSession(0x800000)
 	if err != nil {
-		return nil, err
+		return nil, E.Cause(err, "startSession") //karing
 	}
 	nativeTun.session = session
 	nativeTun.readWait = session.ReadWaitEvent()
@@ -60,7 +60,7 @@ func New(options Options) (WinTun, error) {
 	if err != nil {
 		session.End()
 		adapter.Close()
-		return nil, err
+		return nil, E.Cause(err, "configure") //karing
 	}
 	return nativeTun, nil
 }
