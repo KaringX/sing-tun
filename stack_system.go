@@ -4,12 +4,14 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/sagernet/sing-tun/internal/gtcpip/checksum"
 	"github.com/sagernet/sing-tun/internal/gtcpip/header"
 	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing/common/atomic"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -46,6 +48,9 @@ type System struct {
 	interfaceFinder    control.InterfaceFinder
 	frontHeadroom      int
 	txChecksumOffload  bool
+	running            sync.WaitGroup //karing
+	closeOnce          sync.Once      //karing
+	close              atomic.Int32   //karing
 }
 
 type Session struct {
@@ -91,10 +96,15 @@ func NewSystem(options StackOptions) (Stack, error) {
 }
 
 func (s *System) Close() error {
-	return common.Close(
+	err := common.Close( //karing
 		s.tcpListener,
 		s.tcpListener6,
 	)
+	s.closeOnce.Do(func() { //karing
+		s.close.Store(1)
+		s.running.Wait()
+	})
+	return err //karing
 }
 
 func (s *System) Start() error {
@@ -158,6 +168,8 @@ func (s *System) start() error {
 }
 
 func (s *System) tunLoop() {
+	s.running.Add(1)       //karing
+	defer s.running.Done() //karing
 	if winTun, isWinTun := s.tun.(WinTun); isWinTun {
 		s.wintunLoop(winTun)
 		return
@@ -173,6 +185,9 @@ func (s *System) tunLoop() {
 	}
 	packetBuffer := make([]byte, s.mtu+PacketOffset)
 	for {
+		if s.close.Load() == 1 { //karing
+			return
+		}
 		n, err := s.tun.Read(packetBuffer)
 		if err != nil {
 			if E.IsClosed(err) {
@@ -196,6 +211,9 @@ func (s *System) tunLoop() {
 
 func (s *System) wintunLoop(winTun WinTun) {
 	for {
+		if s.close.Load() == 1 { //karing
+			return
+		}
 		packet, release, err := winTun.ReadPacket()
 		if err != nil {
 			return
@@ -340,11 +358,6 @@ func (s *System) processIPv6(ipHdr header.IPv6) (writeBack bool, err error) {
 }
 
 func (s *System) processIPv4TCP(ipHdr header.IPv4, tcpHdr header.TCP) (bool, error) {
-	if winTun, isWinTun := s.tun.(WinTun); isWinTun { //karing
-		if winTun.IsClosed() {
-			return false, net.ErrClosed
-		}
-	}
 	source := netip.AddrPortFrom(ipHdr.SourceAddr(), tcpHdr.SourcePort())
 	destination := netip.AddrPortFrom(ipHdr.DestinationAddr(), tcpHdr.DestinationPort())
 	if !destination.Addr().IsGlobalUnicast() {
@@ -432,11 +445,6 @@ func (s *System) resetIPv4TCP(origIPHdr header.IPv4, origTCPHdr header.TCP) erro
 }
 
 func (s *System) processIPv6TCP(ipHdr header.IPv6, tcpHdr header.TCP) (bool, error) {
-	if winTun, isWinTun := s.tun.(WinTun); isWinTun { //karing
-		if winTun.IsClosed() {
-			return false, net.ErrClosed
-		}
-	}
 	source := netip.AddrPortFrom(ipHdr.SourceAddr(), tcpHdr.SourcePort())
 	destination := netip.AddrPortFrom(ipHdr.DestinationAddr(), tcpHdr.DestinationPort())
 	if !destination.Addr().IsGlobalUnicast() {
