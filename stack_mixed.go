@@ -63,8 +63,6 @@ func (m *Mixed) Close() error {
 }
 
 func (m *Mixed) tunLoop() {
-	m.running.Add(1)       //karing
-	defer m.running.Done() //karing
 	if winTun, isWinTun := m.tun.(WinTun); isWinTun {
 		m.wintunLoop(winTun)
 		return
@@ -105,6 +103,8 @@ func (m *Mixed) tunLoop() {
 }
 
 func (m *Mixed) wintunLoop(winTun WinTun) {
+	m.running.Add(1)       //karing
+	defer m.running.Done() //karing
 	for {
 		if m.close.Load() == 1 { //karing
 			return

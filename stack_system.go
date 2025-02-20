@@ -168,8 +168,6 @@ func (s *System) start() error {
 }
 
 func (s *System) tunLoop() {
-	s.running.Add(1)       //karing
-	defer s.running.Done() //karing
 	if winTun, isWinTun := s.tun.(WinTun); isWinTun {
 		s.wintunLoop(winTun)
 		return
@@ -210,6 +208,8 @@ func (s *System) tunLoop() {
 }
 
 func (s *System) wintunLoop(winTun WinTun) {
+	s.running.Add(1)       //karing
+	defer s.running.Done() //karing
 	for {
 		if s.close.Load() == 1 { //karing
 			return
