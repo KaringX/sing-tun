@@ -42,6 +42,18 @@ func New(options Options) (WinTun, error) {
 	if options.FileDescriptor != 0 {
 		return nil, os.ErrInvalid
 	}
+	wintun.SetLogFunc(func(level int, message string) { //karing
+		if options.Logger == nil {
+			return
+		}
+		if level == 1 {
+			options.Logger.Warn(message)
+		} else if level == 2 {
+			options.Logger.Error(message)
+		} else {
+			options.Logger.Info(message)
+		}
+	})
 	adapter, err := wintun.CreateAdapter(options.Name, TunnelType, generateGUIDByDeviceName(options.Name))
 	if err != nil {
 		return nil, E.Cause(err, "create") //karing
