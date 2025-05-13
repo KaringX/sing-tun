@@ -202,7 +202,6 @@ func (t *NativeTun) enableGSO() error {
 	err = setUDPOffload(t.tunFd)
 	if err != nil {
 		t.gro.disableUDPGRO()
-		return E.Cause(err, "enable UDP offload")
 	}
 	return nil
 }
@@ -293,7 +292,7 @@ func (t *NativeTun) Start() error {
 	if t.options.FileDescriptor != 0 {
 		return nil
 	}
-
+	t.options.InterfaceMonitor.RegisterMyInterface(t.options.Name)
 	tunLink, err := netlink.LinkByName(t.options.Name)
 	if err != nil {
 		return err
@@ -697,7 +696,7 @@ func (t *NativeTun) rules() []*netlink.Rule {
 		}
 	}
 	if len(t.options.IncludeInterface) > 0 {
-		matchPriority := priority + 2*len(t.options.IncludeInterface) + 1
+		matchPriority := priority + 2
 		for _, includeInterface := range t.options.IncludeInterface {
 			if p4 {
 				it = netlink.NewRule()
@@ -706,7 +705,6 @@ func (t *NativeTun) rules() []*netlink.Rule {
 				it.Goto = matchPriority
 				it.Family = unix.AF_INET
 				rules = append(rules, it)
-				priority++
 			}
 			if p6 {
 				it = netlink.NewRule()
@@ -715,8 +713,13 @@ func (t *NativeTun) rules() []*netlink.Rule {
 				it.Goto = matchPriority
 				it.Family = unix.AF_INET6
 				rules = append(rules, it)
-				priority6++
 			}
+		}
+		if p4 {
+			priority++
+		}
+		if p6 {
+			priority6++
 		}
 		if p4 {
 			it = netlink.NewRule()
@@ -755,7 +758,6 @@ func (t *NativeTun) rules() []*netlink.Rule {
 				it.Goto = nopPriority
 				it.Family = unix.AF_INET
 				rules = append(rules, it)
-				priority++
 			}
 			if p6 {
 				it = netlink.NewRule()
@@ -764,8 +766,14 @@ func (t *NativeTun) rules() []*netlink.Rule {
 				it.Goto = nopPriority
 				it.Family = unix.AF_INET6
 				rules = append(rules, it)
-				priority6++
 			}
+		}
+
+		if p4 {
+			priority++
+		}
+		if p6 {
+			priority6++
 		}
 	}
 
