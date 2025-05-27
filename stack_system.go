@@ -4,19 +4,21 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/sagernet/sing-tun/internal/gtcpip/checksum"
 	"github.com/sagernet/sing-tun/internal/gtcpip/header"
 	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing/common/atomic"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/common/udpnat2"
+	udpnat "github.com/sagernet/sing/common/udpnat2"
 )
 
 var ErrIncludeAllNetworks = E.New("`system` and `mixed` stack are not available when `includeAllNetworks` is enabled. See https://github.com/SagerNet/sing-tun/issues/25")
@@ -46,6 +48,9 @@ type System struct {
 	interfaceFinder    control.InterfaceFinder
 	frontHeadroom      int
 	txChecksumOffload  bool
+	running            sync.WaitGroup //karing
+	closeOnce          sync.Once      //karing
+	close              atomic.Int32   //karing
 }
 
 type Session struct {
@@ -91,10 +96,15 @@ func NewSystem(options StackOptions) (Stack, error) {
 }
 
 func (s *System) Close() error {
-	return common.Close(
+	err := common.Close( //karing
 		s.tcpListener,
 		s.tcpListener6,
 	)
+	s.closeOnce.Do(func() { //karing
+		s.close.Store(1)
+		s.running.Wait()
+	})
+	return err //karing
 }
 
 func (s *System) Start() error {
@@ -171,6 +181,9 @@ func (s *System) tunLoop() {
 	}
 	packetBuffer := make([]byte, s.mtu+PacketOffset)
 	for {
+		if s.close.Load() == 1 { //karing
+			return
+		}
 		n, err := s.tun.Read(packetBuffer)
 		if err != nil {
 			if E.IsClosed(err) {
@@ -193,7 +206,12 @@ func (s *System) tunLoop() {
 }
 
 func (s *System) wintunLoop(winTun WinTun) {
+	s.running.Add(1)       //karing
+	defer s.running.Done() //karing
 	for {
+		if s.close.Load() == 1 { //karing
+			return
+		}
 		packet, release, err := winTun.ReadPacket()
 		if err != nil {
 			return
