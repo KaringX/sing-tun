@@ -23,7 +23,7 @@ type WintunEndpoint struct {
 }
 
 func (e *WintunEndpoint) MTU() uint32 {
-	return e.tun.options.MTU
+	return uint32(e.tun.options.MTU) //karing
 }
 
 func (e *WintunEndpoint) SetMTU(mtu uint32) {

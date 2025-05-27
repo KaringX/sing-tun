@@ -175,7 +175,7 @@ func (t *NativeTun) Name() (string, error) {
 }
 
 func (t *NativeTun) MTU() (int32, error) {
-	return t.options.MTU, nil
+	return int32(t.options.MTU), nil //karing
 }
 
 func (t *NativeTun) Start() error {

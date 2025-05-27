@@ -55,7 +55,7 @@ type Options struct {
 	Name                     string
 	Inet4Address             []netip.Prefix
 	Inet6Address             []netip.Prefix
-	MTU                      int32
+	MTU                      uint32 //karing
 	GSO                      bool
 	AutoRoute                bool
 	InterfaceScope           bool
