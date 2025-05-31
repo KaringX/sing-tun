@@ -192,7 +192,7 @@ func configure(tunFd int, ifIndex int, name string, options Options) error {
 	err = useSocket(unix.AF_INET, unix.SOCK_DGRAM, 0, func(socketFd int) error {
 		var ifr unix.IfreqMTU
 		copy(ifr.Name[:], name)
-		ifr.MTU = options.MTU
+		ifr.MTU = int32(options.MTU) //karing
 		return unix.IoctlSetIfreqMTU(socketFd, &ifr)
 	})
 	if err != nil {
