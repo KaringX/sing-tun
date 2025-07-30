@@ -41,9 +41,21 @@ func New(options Options) (WinTun, error) {
 	if options.FileDescriptor != 0 {
 		return nil, os.ErrInvalid
 	}
+	wintun.SetLogFunc(func(level int, message string) { //karing
+		if options.Logger == nil {
+			return
+		}
+		if level == 1 {
+			options.Logger.Warn(message)
+		} else if level == 2 {
+			options.Logger.Error(message)
+		} else {
+			options.Logger.Info(message)
+		}
+	})
 	adapter, err := wintun.CreateAdapter(options.Name, TunnelType, generateGUIDByDeviceName(options.Name))
 	if err != nil {
-		return nil, err
+		return nil, E.Cause(err, "create") //karing
 	}
 	nativeTun := &NativeTun{
 		adapter: adapter,
@@ -51,7 +63,7 @@ func New(options Options) (WinTun, error) {
 	}
 	session, err := adapter.StartSession(0x800000)
 	if err != nil {
-		return nil, err
+		return nil, E.Cause(err, "startSession") //karing
 	}
 	nativeTun.session = session
 	nativeTun.readWait = session.ReadWaitEvent()
@@ -59,7 +71,7 @@ func New(options Options) (WinTun, error) {
 	if err != nil {
 		session.End()
 		adapter.Close()
-		return nil, err
+		return nil, E.Cause(err, "configure") //karing
 	}
 	return nativeTun, nil
 }
@@ -159,6 +171,10 @@ func (t *NativeTun) configure() error {
 
 func (t *NativeTun) Name() (string, error) {
 	return t.options.Name, nil
+}
+
+func (t *NativeTun) MTU() (int32, error) {
+	return int32(t.options.MTU), nil //karing
 }
 
 func (t *NativeTun) Start() error {

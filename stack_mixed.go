@@ -84,6 +84,9 @@ func (m *Mixed) tunLoop() {
 	}
 	packetBuffer := make([]byte, m.mtu+PacketOffset)
 	for {
+		if m.close.Load() == 1 { //karing
+			return
+		}
 		n, err := m.tun.Read(packetBuffer)
 		if err != nil {
 			if E.IsClosed(err) {
@@ -106,7 +109,12 @@ func (m *Mixed) tunLoop() {
 }
 
 func (m *Mixed) wintunLoop(winTun WinTun) {
+	m.running.Add(1)       //karing
+	defer m.running.Done() //karing
 	for {
+		if m.close.Load() == 1 { //karing
+			return
+		}
 		packet, release, err := winTun.ReadPacket()
 		if err != nil {
 			return
