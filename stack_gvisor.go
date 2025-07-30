@@ -26,19 +26,22 @@ const WithGVisor = true
 const DefaultNIC tcpip.NICID = 1
 
 type GVisor struct {
-	ctx           context.Context
-	tun           GVisorTun
-	udpTimeout    time.Duration
-	broadcastAddr netip.Addr
-	handler       Handler
-	logger        logger.Logger
-	stack         *stack.Stack
-	endpoint      stack.LinkEndpoint
+	ctx                  context.Context
+	tun                  GVisorTun
+	inet4LoopbackAddress []netip.Addr
+	inet6LoopbackAddress []netip.Addr
+	udpTimeout           time.Duration
+	broadcastAddr        netip.Addr
+	handler              Handler
+	logger               logger.Logger
+	stack                *stack.Stack
+	endpoint             stack.LinkEndpoint
 }
 
 type GVisorTun interface {
 	Tun
-	NewEndpoint() (stack.LinkEndpoint, error)
+	WritePacket(pkt *stack.PacketBuffer) (int, error)
+	NewEndpoint() (stack.LinkEndpoint, stack.NICOptions, error)
 }
 
 func NewGVisor(
@@ -50,27 +53,29 @@ func NewGVisor(
 	}
 
 	gStack := &GVisor{
-		ctx:           options.Context,
-		tun:           gTun,
-		udpTimeout:    options.UDPTimeout,
-		broadcastAddr: BroadcastAddr(options.TunOptions.Inet4Address),
-		handler:       options.Handler,
-		logger:        options.Logger,
+		ctx:                  options.Context,
+		tun:                  gTun,
+		inet4LoopbackAddress: options.TunOptions.Inet4LoopbackAddress,
+		inet6LoopbackAddress: options.TunOptions.Inet6LoopbackAddress,
+		udpTimeout:           options.UDPTimeout,
+		broadcastAddr:        BroadcastAddr(options.TunOptions.Inet4Address),
+		handler:              options.Handler,
+		logger:               options.Logger,
 	}
 	return gStack, nil
 }
 
 func (t *GVisor) Start() error {
-	linkEndpoint, err := t.tun.NewEndpoint()
+	linkEndpoint, nicOptions, err := t.tun.NewEndpoint()
 	if err != nil {
 		return err
 	}
 	linkEndpoint = &LinkEndpointFilter{linkEndpoint, t.broadcastAddr, t.tun}
-	ipStack, err := NewGVisorStack(linkEndpoint)
+	ipStack, err := NewGVisorStackWithOptions(linkEndpoint, nicOptions)
 	if err != nil {
 		return err
 	}
-	ipStack.SetTransportProtocolHandler(tcp.ProtocolNumber, NewTCPForwarder(t.ctx, ipStack, t.handler).HandlePacket)
+	ipStack.SetTransportProtocolHandler(tcp.ProtocolNumber, NewTCPForwarderWithLoopback(t.ctx, ipStack, t.handler, t.inet4LoopbackAddress, t.inet6LoopbackAddress, t.tun).HandlePacket)
 	ipStack.SetTransportProtocolHandler(udp.ProtocolNumber, NewUDPForwarder(t.ctx, ipStack, t.handler, t.udpTimeout).HandlePacket)
 	t.stack = ipStack
 	t.endpoint = linkEndpoint
@@ -106,6 +111,10 @@ func AddrFromAddress(address tcpip.Address) netip.Addr {
 }
 
 func NewGVisorStack(ep stack.LinkEndpoint) (*stack.Stack, error) {
+	return NewGVisorStackWithOptions(ep, stack.NICOptions{})
+}
+
+func NewGVisorStackWithOptions(ep stack.LinkEndpoint, opts stack.NICOptions) (*stack.Stack, error) {
 	ipStack := stack.New(stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{
 			ipv4.NewProtocol,
@@ -118,7 +127,7 @@ func NewGVisorStack(ep stack.LinkEndpoint) (*stack.Stack, error) {
 			icmp.NewProtocol6,
 		},
 	})
-	err := ipStack.CreateNIC(DefaultNIC, ep)
+	err := ipStack.CreateNICWithOptions(DefaultNIC, ep, opts)
 	if err != nil {
 		return nil, gonet.TranslateNetstackError(err)
 	}

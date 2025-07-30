@@ -2,6 +2,7 @@ package tun
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
 	"syscall"
@@ -22,30 +23,33 @@ import (
 var ErrIncludeAllNetworks = E.New("`system` and `mixed` stack are not available when `includeAllNetworks` is enabled. See https://github.com/SagerNet/sing-tun/issues/25")
 
 type System struct {
-	ctx                context.Context
-	tun                Tun
-	tunName            string
-	mtu                int
-	handler            Handler
-	logger             logger.Logger
-	inet4Prefixes      []netip.Prefix
-	inet6Prefixes      []netip.Prefix
-	inet4ServerAddress netip.Addr
-	inet4Address       netip.Addr
-	inet6ServerAddress netip.Addr
-	inet6Address       netip.Addr
-	broadcastAddr      netip.Addr
-	udpTimeout         time.Duration
-	tcpListener        net.Listener
-	tcpListener6       net.Listener
-	tcpPort            uint16
-	tcpPort6           uint16
-	tcpNat             *TCPNat
-	udpNat             *udpnat.Service
-	bindInterface      bool
-	interfaceFinder    control.InterfaceFinder
-	frontHeadroom      int
-	txChecksumOffload  bool
+	ctx                  context.Context
+	tun                  Tun
+	tunName              string
+	mtu                  int
+	handler              Handler
+	logger               logger.Logger
+	inet4Prefixes        []netip.Prefix
+	inet6Prefixes        []netip.Prefix
+	inet4ServerAddress   netip.Addr
+	inet4Address         netip.Addr
+	inet6ServerAddress   netip.Addr
+	inet6Address         netip.Addr
+	broadcastAddr        netip.Addr
+	inet4LoopbackAddress []netip.Addr
+	inet6LoopbackAddress []netip.Addr
+	udpTimeout           time.Duration
+	tcpListener          net.Listener
+	tcpListener6         net.Listener
+	tcpPort              uint16
+	tcpPort6             uint16
+	tcpNat               *TCPNat
+	udpNat               *udpnat.Service
+	bindInterface        bool
+	interfaceFinder      control.InterfaceFinder
+	frontHeadroom        int
+	txChecksumOffload    bool
+	multiPendingPackets  bool
 }
 
 type Session struct {
@@ -57,18 +61,21 @@ type Session struct {
 
 func NewSystem(options StackOptions) (Stack, error) {
 	stack := &System{
-		ctx:             options.Context,
-		tun:             options.Tun,
-		tunName:         options.TunOptions.Name,
-		mtu:             int(options.TunOptions.MTU),
-		udpTimeout:      options.UDPTimeout,
-		handler:         options.Handler,
-		logger:          options.Logger,
-		inet4Prefixes:   options.TunOptions.Inet4Address,
-		inet6Prefixes:   options.TunOptions.Inet6Address,
-		broadcastAddr:   BroadcastAddr(options.TunOptions.Inet4Address),
-		bindInterface:   options.ForwarderBindInterface,
-		interfaceFinder: options.InterfaceFinder,
+		ctx:                  options.Context,
+		tun:                  options.Tun,
+		tunName:              options.TunOptions.Name,
+		mtu:                  int(options.TunOptions.MTU),
+		inet4LoopbackAddress: options.TunOptions.Inet4LoopbackAddress,
+		inet6LoopbackAddress: options.TunOptions.Inet6LoopbackAddress,
+		udpTimeout:           options.UDPTimeout,
+		handler:              options.Handler,
+		logger:               options.Logger,
+		inet4Prefixes:        options.TunOptions.Inet4Address,
+		inet6Prefixes:        options.TunOptions.Inet6Address,
+		broadcastAddr:        BroadcastAddr(options.TunOptions.Inet4Address),
+		bindInterface:        options.ForwarderBindInterface,
+		interfaceFinder:      options.InterfaceFinder,
+		multiPendingPackets:  options.TunOptions.EXP_MultiPendingPackets,
 	}
 	if len(options.TunOptions.Inet4Address) > 0 {
 		if !HasNextAddress(options.TunOptions.Inet4Address[0], 1) {
@@ -165,9 +172,13 @@ func (s *System) tunLoop() {
 		s.txChecksumOffload = linuxTUN.TXChecksumOffload()
 		batchSize := linuxTUN.BatchSize()
 		if batchSize > 1 {
-			s.batchLoop(linuxTUN, batchSize)
+			s.batchLoopLinux(linuxTUN, batchSize)
 			return
 		}
+	}
+	if darwinTUN, isDarwinTUN := s.tun.(DarwinTUN); isDarwinTUN && s.multiPendingPackets {
+		s.batchLoopDarwin(darwinTUN)
+		return
 	}
 	packetBuffer := make([]byte, s.mtu+PacketOffset)
 	for {
@@ -212,7 +223,7 @@ func (s *System) wintunLoop(winTun WinTun) {
 	}
 }
 
-func (s *System) batchLoop(linuxTUN LinuxTUN, batchSize int) {
+func (s *System) batchLoopLinux(linuxTUN LinuxTUN, batchSize int) {
 	packetBuffers := make([][]byte, batchSize)
 	writeBuffers := make([][]byte, batchSize)
 	packetSizes := make([]int, batchSize)
@@ -247,6 +258,40 @@ func (s *System) batchLoop(linuxTUN LinuxTUN, batchSize int) {
 				s.logger.Trace(E.Cause(err, "batch write packet"))
 			}
 			writeBuffers = writeBuffers[:0]
+		}
+	}
+}
+
+func (s *System) batchLoopDarwin(darwinTUN DarwinTUN) {
+	var writeBuffers []*buf.Buffer
+	for {
+		buffers, err := darwinTUN.BatchRead()
+		if err != nil {
+			if E.IsClosed(err) {
+				return
+			}
+			s.logger.Error(E.Cause(err, "batch read packet"))
+		}
+		if len(buffers) == 0 {
+			continue
+		}
+		writeBuffers = writeBuffers[:0]
+		for _, buffer := range buffers {
+			packetSize := buffer.Len()
+			if packetSize < header.IPv4MinimumSize {
+				continue
+			}
+			if s.processPacket(buffer.Bytes()) {
+				writeBuffers = append(writeBuffers, buffer)
+			} else {
+				buffer.Release()
+			}
+		}
+		if len(writeBuffers) > 0 {
+			err = darwinTUN.BatchWrite(writeBuffers)
+			if err != nil {
+				s.logger.Trace(E.Cause(err, "batch write packet"))
+			}
 		}
 	}
 }
@@ -352,18 +397,29 @@ func (s *System) processIPv4TCP(ipHdr header.IPv4, tcpHdr header.TCP) (bool, err
 		ipHdr.SetDestinationAddr(session.Source.Addr())
 		tcpHdr.SetDestinationPort(session.Source.Port())
 	} else {
-		natPort, err := s.tcpNat.Lookup(source, destination, s.handler)
-		if err != nil {
-			if err == ErrDrop {
-				return false, nil
-			} else {
-				return false, s.resetIPv4TCP(ipHdr, tcpHdr)
+		var loopback bool
+		for _, inet4LoopbackAddress := range s.inet4LoopbackAddress {
+			if destination.Addr() == inet4LoopbackAddress {
+				ipHdr.SetDestinationAddr(ipHdr.SourceAddr())
+				ipHdr.SetSourceAddr(inet4LoopbackAddress)
+				loopback = true
+				break
 			}
 		}
-		ipHdr.SetSourceAddr(s.inet4Address)
-		tcpHdr.SetSourcePort(natPort)
-		ipHdr.SetDestinationAddr(s.inet4ServerAddress)
-		tcpHdr.SetDestinationPort(s.tcpPort)
+		if !loopback {
+			natPort, err := s.tcpNat.Lookup(source, destination, s.handler)
+			if err != nil {
+				if errors.Is(err, ErrDrop) {
+					return false, nil
+				} else {
+					return false, s.resetIPv4TCP(ipHdr, tcpHdr)
+				}
+			}
+			ipHdr.SetSourceAddr(s.inet4Address)
+			tcpHdr.SetSourcePort(natPort)
+			ipHdr.SetDestinationAddr(s.inet4ServerAddress)
+			tcpHdr.SetDestinationPort(s.tcpPort)
+		}
 	}
 	if !s.txChecksumOffload {
 		tcpHdr.SetChecksum(0)
@@ -439,18 +495,29 @@ func (s *System) processIPv6TCP(ipHdr header.IPv6, tcpHdr header.TCP) (bool, err
 		ipHdr.SetDestinationAddr(session.Source.Addr())
 		tcpHdr.SetDestinationPort(session.Source.Port())
 	} else {
-		natPort, err := s.tcpNat.Lookup(source, destination, s.handler)
-		if err != nil {
-			if err == ErrDrop {
-				return false, nil
-			} else {
-				return false, s.resetIPv6TCP(ipHdr, tcpHdr)
+		var loopback bool
+		for _, inet6LoopbackAddress := range s.inet6LoopbackAddress {
+			if destination.Addr() == inet6LoopbackAddress {
+				ipHdr.SetDestinationAddr(ipHdr.SourceAddr())
+				ipHdr.SetSourceAddr(inet6LoopbackAddress)
+				loopback = true
+				break
 			}
 		}
-		ipHdr.SetSourceAddr(s.inet6Address)
-		tcpHdr.SetSourcePort(natPort)
-		ipHdr.SetDestinationAddr(s.inet6ServerAddress)
-		tcpHdr.SetDestinationPort(s.tcpPort6)
+		if !loopback {
+			natPort, err := s.tcpNat.Lookup(source, destination, s.handler)
+			if err != nil {
+				if errors.Is(err, ErrDrop) {
+					return false, nil
+				} else {
+					return false, s.resetIPv6TCP(ipHdr, tcpHdr)
+				}
+			}
+			ipHdr.SetSourceAddr(s.inet6Address)
+			tcpHdr.SetSourcePort(natPort)
+			ipHdr.SetDestinationAddr(s.inet6ServerAddress)
+			tcpHdr.SetDestinationPort(s.tcpPort6)
+		}
 	}
 	if !s.txChecksumOffload {
 		tcpHdr.SetChecksum(0)
@@ -536,7 +603,7 @@ func (s *System) processIPv6UDP(ipHdr header.IPv6, udpHdr header.UDP) error {
 func (s *System) preparePacketConnection(source M.Socksaddr, destination M.Socksaddr, userData any) (bool, context.Context, N.PacketWriter, N.CloseHandlerFunc) {
 	pErr := s.handler.PrepareConnection(N.NetworkUDP, source, destination)
 	if pErr != nil {
-		if pErr != ErrDrop {
+		if !errors.Is(pErr, ErrDrop) {
 			if source.IsIPv4() {
 				ipHdr := userData.(header.IPv4)
 				s.rejectIPv4WithICMP(ipHdr, header.ICMPv4PortUnreachable)

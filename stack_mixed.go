@@ -10,12 +10,13 @@ import (
 	"github.com/sagernet/gvisor/pkg/tcpip/stack"
 	"github.com/sagernet/gvisor/pkg/tcpip/transport/udp"
 	"github.com/sagernet/sing-tun/internal/gtcpip/header"
-	"github.com/sagernet/sing/common/bufio"
+	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
 type Mixed struct {
 	*System
+	tun      GVisorTun
 	stack    *stack.Stack
 	endpoint *channel.Endpoint
 }
@@ -29,6 +30,7 @@ func NewMixed(
 	}
 	return &Mixed{
 		System: system.(*System),
+		tun:    system.(*System).tun.(GVisorTun),
 	}, nil
 }
 
@@ -72,9 +74,13 @@ func (m *Mixed) tunLoop() {
 		m.txChecksumOffload = linuxTUN.TXChecksumOffload()
 		batchSize := linuxTUN.BatchSize()
 		if batchSize > 1 {
-			m.batchLoop(linuxTUN, batchSize)
+			m.batchLoopLinux(linuxTUN, batchSize)
 			return
 		}
+	}
+	if darwinTUN, isDarwinTUN := m.tun.(DarwinTUN); isDarwinTUN && m.multiPendingPackets {
+		m.batchLoopDarwin(darwinTUN)
+		return
 	}
 	packetBuffer := make([]byte, m.mtu+PacketOffset)
 	for {
@@ -119,12 +125,12 @@ func (m *Mixed) wintunLoop(winTun WinTun) {
 	}
 }
 
-func (m *Mixed) batchLoop(linuxTUN LinuxTUN, batchSize int) {
+func (m *Mixed) batchLoopLinux(linuxTUN LinuxTUN, batchSize int) {
 	packetBuffers := make([][]byte, batchSize)
 	writeBuffers := make([][]byte, batchSize)
 	packetSizes := make([]int, batchSize)
 	for i := range packetBuffers {
-		packetBuffers[i] = make([]byte, m.mtu+m.frontHeadroom)
+		packetBuffers[i] = make([]byte, m.mtu+PacketOffset+m.frontHeadroom)
 	}
 	for {
 		n, err := linuxTUN.BatchRead(packetBuffers, m.frontHeadroom, packetSizes)
@@ -154,6 +160,40 @@ func (m *Mixed) batchLoop(linuxTUN LinuxTUN, batchSize int) {
 				m.logger.Trace(E.Cause(err, "batch write packet"))
 			}
 			writeBuffers = writeBuffers[:0]
+		}
+	}
+}
+
+func (m *Mixed) batchLoopDarwin(darwinTUN DarwinTUN) {
+	var writeBuffers []*buf.Buffer
+	for {
+		buffers, err := darwinTUN.BatchRead()
+		if err != nil {
+			if E.IsClosed(err) {
+				return
+			}
+			m.logger.Error(E.Cause(err, "batch read packet"))
+		}
+		if len(buffers) == 0 {
+			continue
+		}
+		writeBuffers = writeBuffers[:0]
+		for _, buffer := range buffers {
+			packetSize := buffer.Len()
+			if packetSize < header.IPv4MinimumSize {
+				continue
+			}
+			if m.processPacket(buffer.Bytes()) {
+				writeBuffers = append(writeBuffers, buffer)
+			} else {
+				buffer.Release()
+			}
+		}
+		if len(writeBuffers) > 0 {
+			err = darwinTUN.BatchWrite(writeBuffers)
+			if err != nil {
+				m.logger.Trace(E.Cause(err, "batch write packet"))
+			}
 		}
 	}
 }
@@ -226,11 +266,11 @@ func (m *Mixed) processIPv6(ipHdr header.IPv6) (writeBack bool, err error) {
 
 func (m *Mixed) packetLoop() {
 	for {
-		packet := m.endpoint.ReadContext(m.ctx)
-		if packet == nil {
+		pkt := m.endpoint.ReadContext(m.ctx)
+		if pkt == nil {
 			break
 		}
-		bufio.WriteVectorised(m.tun, packet.AsSlices())
-		packet.DecRef()
+		m.tun.WritePacket(pkt)
+		pkt.DecRef()
 	}
 }

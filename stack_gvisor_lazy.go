@@ -4,8 +4,10 @@ package tun
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/sagernet/gvisor/pkg/tcpip"
@@ -17,19 +19,25 @@ import (
 )
 
 type gLazyConn struct {
-	tcpConn       *gonet.TCPConn
-	parentCtx     context.Context
-	stack         *stack.Stack
-	request       *tcp.ForwarderRequest
-	localAddr     net.Addr
-	remoteAddr    net.Addr
-	handshakeDone bool
-	handshakeErr  error
+	tcpConn         *gonet.TCPConn
+	parentCtx       context.Context
+	stack           *stack.Stack
+	request         *tcp.ForwarderRequest
+	localAddr       net.Addr
+	remoteAddr      net.Addr
+	handshakeAccess sync.Mutex
+	handshakeDone   bool
+	handshakeErr    error
 }
 
 func (c *gLazyConn) HandshakeContext(ctx context.Context) error {
 	if c.handshakeDone {
-		return nil
+		return c.handshakeErr
+	}
+	c.handshakeAccess.Lock()
+	defer c.handshakeAccess.Unlock()
+	if c.handshakeDone {
+		return c.handshakeErr
 	}
 	defer func() {
 		c.handshakeDone = true
@@ -67,7 +75,12 @@ func (c *gLazyConn) HandshakeFailure(err error) error {
 	if c.handshakeDone {
 		return os.ErrInvalid
 	}
-	c.request.Complete(err != ErrDrop)
+	c.handshakeAccess.Lock()
+	defer c.handshakeAccess.Unlock()
+	if c.handshakeDone {
+		return os.ErrInvalid
+	}
+	c.request.Complete(!errors.Is(err, ErrDrop))
 	c.handshakeDone = true
 	c.handshakeErr = err
 	return nil
@@ -78,25 +91,17 @@ func (c *gLazyConn) HandshakeSuccess() error {
 }
 
 func (c *gLazyConn) Read(b []byte) (n int, err error) {
-	if !c.handshakeDone {
-		err = c.HandshakeContext(context.Background())
-		if err != nil {
-			return
-		}
-	} else if c.handshakeErr != nil {
-		return 0, c.handshakeErr
+	err = c.HandshakeContext(context.Background())
+	if err != nil {
+		return
 	}
 	return c.tcpConn.Read(b)
 }
 
 func (c *gLazyConn) Write(b []byte) (n int, err error) {
-	if !c.handshakeDone {
-		err = c.HandshakeContext(context.Background())
-		if err != nil {
-			return
-		}
-	} else if c.handshakeErr != nil {
-		return 0, c.handshakeErr
+	err = c.HandshakeContext(context.Background())
+	if err != nil {
+		return
 	}
 	return c.tcpConn.Write(b)
 }
@@ -110,46 +115,41 @@ func (c *gLazyConn) RemoteAddr() net.Addr {
 }
 
 func (c *gLazyConn) SetDeadline(t time.Time) error {
-	if !c.handshakeDone {
-		err := c.HandshakeContext(context.Background())
-		if err != nil {
-			return err
-		}
-	} else if c.handshakeErr != nil {
-		return c.handshakeErr
+	err := c.HandshakeContext(context.Background())
+	if err != nil {
+		return err
 	}
 	return c.tcpConn.SetDeadline(t)
 }
 
 func (c *gLazyConn) SetReadDeadline(t time.Time) error {
-	if !c.handshakeDone {
-		err := c.HandshakeContext(context.Background())
-		if err != nil {
-			return err
-		}
-	} else if c.handshakeErr != nil {
-		return c.handshakeErr
+	err := c.HandshakeContext(context.Background())
+	if err != nil {
+		return err
 	}
 	return c.tcpConn.SetReadDeadline(t)
 }
 
 func (c *gLazyConn) SetWriteDeadline(t time.Time) error {
-	if !c.handshakeDone {
-		err := c.HandshakeContext(context.Background())
-		if err != nil {
-			return err
-		}
-	} else if c.handshakeErr != nil {
-		return c.handshakeErr
+	err := c.HandshakeContext(context.Background())
+	if err != nil {
+		return err
 	}
 	return c.tcpConn.SetWriteDeadline(t)
 }
 
 func (c *gLazyConn) Close() error {
 	if !c.handshakeDone {
-		c.request.Complete(true)
-		c.handshakeErr = net.ErrClosed
-		return nil
+		c.handshakeAccess.Lock()
+		if !c.handshakeDone {
+			c.request.Complete(true)
+			c.handshakeErr = net.ErrClosed
+			c.handshakeDone = true
+			return nil
+		} else if c.handshakeErr != nil {
+			return nil
+		}
+		c.handshakeAccess.Unlock()
 	} else if c.handshakeErr != nil {
 		return nil
 	}
@@ -158,9 +158,16 @@ func (c *gLazyConn) Close() error {
 
 func (c *gLazyConn) CloseRead() error {
 	if !c.handshakeDone {
-		c.request.Complete(true)
-		c.handshakeErr = net.ErrClosed
-		return nil
+		c.handshakeAccess.Lock()
+		if !c.handshakeDone {
+			c.request.Complete(true)
+			c.handshakeErr = net.ErrClosed
+			c.handshakeDone = true
+			return nil
+		} else if c.handshakeErr != nil {
+			return nil
+		}
+		c.handshakeAccess.Unlock()
 	} else if c.handshakeErr != nil {
 		return nil
 	}
@@ -169,9 +176,16 @@ func (c *gLazyConn) CloseRead() error {
 
 func (c *gLazyConn) CloseWrite() error {
 	if !c.handshakeDone {
-		c.request.Complete(true)
-		c.handshakeErr = net.ErrClosed
-		return nil
+		c.handshakeAccess.Lock()
+		if !c.handshakeDone {
+			c.request.Complete(true)
+			c.handshakeErr = net.ErrClosed
+			c.handshakeDone = true
+			return nil
+		} else if c.handshakeErr != nil {
+			return nil
+		}
+		c.handshakeAccess.Unlock()
 	} else if c.handshakeErr != nil {
 		return nil
 	}
@@ -179,10 +193,14 @@ func (c *gLazyConn) CloseWrite() error {
 }
 
 func (c *gLazyConn) ReaderReplaceable() bool {
+	c.handshakeAccess.Lock()
+	defer c.handshakeAccess.Unlock()
 	return c.handshakeDone && c.handshakeErr == nil
 }
 
 func (c *gLazyConn) WriterReplaceable() bool {
+	c.handshakeAccess.Lock()
+	defer c.handshakeAccess.Unlock()
 	return c.handshakeDone && c.handshakeErr == nil
 }
 

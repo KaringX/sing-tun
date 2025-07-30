@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/control"
 	F "github.com/sagernet/sing/common/format"
 	"github.com/sagernet/sing/common/logger"
@@ -24,9 +25,7 @@ type Handler interface {
 
 type Tun interface {
 	io.ReadWriter
-	N.VectorisedWriter
 	Name() (string, error)
-	MTU() (int32, error)
 	Start() error
 	Close() error
 	UpdateRouteOptions(tunOptions Options) error
@@ -46,6 +45,12 @@ type LinuxTUN interface {
 	TXChecksumOffload() bool
 }
 
+type DarwinTUN interface {
+	Tun
+	BatchRead() ([]*buf.Buffer, error)
+	BatchWrite(buffers []*buf.Buffer) error
+}
+
 const (
 	DefaultIPRoute2TableIndex = 2022
 	DefaultIPRoute2RuleIndex  = 9000
@@ -55,7 +60,7 @@ type Options struct {
 	Name                     string
 	Inet4Address             []netip.Prefix
 	Inet6Address             []netip.Prefix
-	MTU                      int32
+	MTU                      uint32
 	GSO                      bool
 	AutoRoute                bool
 	InterfaceScope           bool
@@ -67,6 +72,8 @@ type Options struct {
 	AutoRedirectMarkMode     bool
 	AutoRedirectInputMark    uint32
 	AutoRedirectOutputMark   uint32
+	Inet4LoopbackAddress     []netip.Addr
+	Inet6LoopbackAddress     []netip.Addr
 	StrictRoute              bool
 	Inet4RouteAddress        []netip.Prefix
 	Inet6RouteAddress        []netip.Prefix
@@ -89,6 +96,13 @@ type Options struct {
 
 	// For library usages.
 	EXP_DisableDNSHijack bool
+
+	// For gvisor stack, it should be enabled when MTU is less than 32768; otherwise it should be less than or equal to 8192.
+	// The above condition is just an estimate and not exact, calculated on M4 pro.
+	EXP_MultiPendingPackets bool
+
+	// Will cause the darwin network to die, do not use.
+	EXP_SendMsgX bool
 }
 
 func (o *Options) Inet4GatewayAddr() netip.Addr {
