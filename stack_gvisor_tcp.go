@@ -52,7 +52,7 @@ func (f *TCPForwarder) HandlePacket(id stack.TransportEndpointID, pkt *stack.Pac
 			ipHdr.SetSourceAddressWithChecksumUpdate(inet4LoopbackAddress)
 			tcpHdr := header.TCP(pkt.TransportHeader().Slice())
 			tcpHdr.SetChecksum(0)
-			tcpHdr.SetChecksum(^checksum.Checksum(tcpHdr.Payload(), tcpHdr.CalculateChecksum(
+			tcpHdr.SetChecksum(^checksum.Combine(pkt.Data().Checksum(), tcpHdr.CalculateChecksum(
 				header.PseudoHeaderChecksum(header.TCPProtocolNumber, ipHdr.SourceAddress(), ipHdr.DestinationAddress(), ipHdr.PayloadLength()),
 			)))
 			f.tun.WritePacket(pkt)
@@ -66,7 +66,7 @@ func (f *TCPForwarder) HandlePacket(id stack.TransportEndpointID, pkt *stack.Pac
 			ipHdr.SetSourceAddress(inet6LoopbackAddress)
 			tcpHdr := header.TCP(pkt.TransportHeader().Slice())
 			tcpHdr.SetChecksum(0)
-			tcpHdr.SetChecksum(^checksum.Checksum(tcpHdr.Payload(), tcpHdr.CalculateChecksum(
+			tcpHdr.SetChecksum(^checksum.Combine(pkt.Data().Checksum(), tcpHdr.CalculateChecksum(
 				header.PseudoHeaderChecksum(header.TCPProtocolNumber, ipHdr.SourceAddress(), ipHdr.DestinationAddress(), ipHdr.PayloadLength()),
 			)))
 			f.tun.WritePacket(pkt)
@@ -79,7 +79,7 @@ func (f *TCPForwarder) HandlePacket(id stack.TransportEndpointID, pkt *stack.Pac
 func (f *TCPForwarder) Forward(r *tcp.ForwarderRequest) {
 	source := M.SocksaddrFrom(AddrFromAddress(r.ID().RemoteAddress), r.ID().RemotePort)
 	destination := M.SocksaddrFrom(AddrFromAddress(r.ID().LocalAddress), r.ID().LocalPort)
-	pErr := f.handler.PrepareConnection(N.NetworkTCP, source, destination)
+	_, pErr := f.handler.PrepareConnection(N.NetworkTCP, source, destination, nil, 0)
 	if pErr != nil {
 		r.Complete(!errors.Is(pErr, ErrDrop))
 		return

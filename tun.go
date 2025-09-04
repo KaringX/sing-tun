@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/control"
@@ -18,9 +19,19 @@ import (
 )
 
 type Handler interface {
-	PrepareConnection(network string, source M.Socksaddr, destination M.Socksaddr) error
+	PrepareConnection(
+		network string,
+		source M.Socksaddr,
+		destination M.Socksaddr,
+		routeContext DirectRouteContext,
+		timeout time.Duration,
+	) (DirectRouteDestination, error)
 	N.TCPConnectionHandlerEx
 	N.UDPConnectionHandlerEx
+}
+
+type DirectRouteContext interface {
+	WritePacket(packet []byte) error
 }
 
 type Tun interface {
