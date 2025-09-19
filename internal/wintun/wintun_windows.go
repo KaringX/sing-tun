@@ -72,6 +72,10 @@ func SetLogFunc(log func(level int, message string)) { //karing
 // deterministically. If it is set to nil, the GUID is chosen by the system at random,
 // and hence a new NLA entry is created for each new adapter.
 func CreateAdapter(name string, tunnelType string, requestedGUID *windows.GUID) (wintun *Adapter, err error) {
+	err = procWintunCloseAdapter.Find()
+	if err != nil {
+		return
+	}
 	var name16 *uint16
 	name16, err = windows.UTF16PtrFromString(name)
 	if err != nil {
