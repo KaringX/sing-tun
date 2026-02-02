@@ -197,6 +197,13 @@ func (t *NativeTun) Start() error {
 		return err
 	}
 	if t.options.StrictRoute {
+		major, _, _ := windows.RtlGetNtVersionNumbers()
+		if major < 10 {
+			if t.options.Logger != nil {
+				t.options.Logger.Warn("strict routing is not supported on Windows versions below 10")
+			}
+			return nil
+		}
 		var engine uintptr
 		session := &winsys.FWPM_SESSION0{Flags: winsys.FWPM_SESSION_FLAG_DYNAMIC}
 		err := winsys.FwpmEngineOpen0(nil, winsys.RPC_C_AUTHN_DEFAULT, nil, session, unsafe.Pointer(&engine))
@@ -411,15 +418,16 @@ retry:
 
 func (t *NativeTun) ReadPacket() ([]byte, func(), error) {
 	t.running.Add(1)
-	defer t.running.Done()
 retry:
 	if t.close.Load() == 1 {
+		t.running.Done()
 		return nil, nil, os.ErrClosed
 	}
 	start := nanotime()
 	shouldSpin := t.rate.current.Load() >= spinloopRateThreshold && uint64(start-t.rate.nextStartTime.Load()) <= rateMeasurementGranularity*2
 	for {
 		if t.close.Load() == 1 {
+			t.running.Done()
 			return nil, nil, os.ErrClosed
 		}
 		packet, err := t.session.ReceivePacket()
@@ -427,7 +435,10 @@ retry:
 		case nil:
 			packetSize := len(packet)
 			t.rate.update(uint64(packetSize))
-			return packet, func() { t.session.ReleaseReceivePacket(packet) }, nil
+			return packet, func() {
+				t.session.ReleaseReceivePacket(packet)
+				t.running.Done()
+			}, nil
 		case windows.ERROR_NO_MORE_ITEMS:
 			if !shouldSpin || uint64(nanotime()-start) >= spinloopDuration {
 				windows.WaitForSingleObject(t.readWait, windows.INFINITE)
@@ -436,10 +447,13 @@ retry:
 			procyield(1)
 			continue
 		case windows.ERROR_HANDLE_EOF:
+			t.running.Done()
 			return nil, nil, os.ErrClosed
 		case windows.ERROR_INVALID_DATA:
+			t.running.Done()
 			return nil, nil, errors.New("send ring corrupt")
 		}
+		t.running.Done()
 		return nil, nil, fmt.Errorf("read failed: %w", err)
 	}
 }
