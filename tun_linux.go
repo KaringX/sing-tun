@@ -3,7 +3,6 @@ package tun
 import (
 	"errors"
 	"fmt"
-	"math/rand"
 	"net"
 	"net/netip"
 	"os"
@@ -125,22 +124,23 @@ func (t *NativeTun) configure(tunLink netlink.Link) error {
 	} else if err != nil {
 		return err
 	}
-
-	if len(t.options.Inet4Address) > 0 {
-		for _, address := range t.options.Inet4Address {
-			addr4, _ := netlink.ParseAddr(address.String())
-			err = netlink.AddrAdd(tunLink, addr4)
-			if err != nil {
-				return err
+	if !t.options.EXP_ExternalConfiguration {
+		if len(t.options.Inet4Address) > 0 {
+			for _, address := range t.options.Inet4Address {
+				addr4, _ := netlink.ParseAddr(address.String())
+				err = netlink.AddrAdd(tunLink, addr4)
+				if err != nil && !errors.Is(err, unix.EEXIST) {
+					return err
+				}
 			}
 		}
-	}
-	if len(t.options.Inet6Address) > 0 {
-		for _, address := range t.options.Inet6Address {
-			addr6, _ := netlink.ParseAddr(address.String())
-			err = netlink.AddrAdd(tunLink, addr6)
-			if err != nil {
-				return err
+		if len(t.options.Inet6Address) > 0 {
+			for _, address := range t.options.Inet6Address {
+				addr6, _ := netlink.ParseAddr(address.String())
+				err = netlink.AddrAdd(tunLink, addr6)
+				if err != nil && !errors.Is(err, unix.EEXIST) {
+					return err
+				}
 			}
 		}
 	}
@@ -254,10 +254,16 @@ func (t *NativeTun) Name() (string, error) {
 }
 
 func (t *NativeTun) Start() error {
+	err := t.disableReversePathFilter()
+	if err != nil && t.options.Logger != nil && t.options.FileDescriptor == 0 {
+		t.options.Logger.Warn(E.Cause(err, "disable reverse path filter"))
+	}
 	if t.options.FileDescriptor != 0 {
 		return nil
 	}
-	t.options.InterfaceMonitor.RegisterMyInterface(t.options.Name)
+	if !t.options.EXP_ExternalConfiguration {
+		t.options.InterfaceMonitor.RegisterMyInterface(t.options.Name)
+	}
 	tunLink, err := netlink.LinkByName(t.options.Name)
 	if err != nil {
 		return err
@@ -277,14 +283,8 @@ func (t *NativeTun) Start() error {
 		}
 	}
 
-	if t.options.IPRoute2TableIndex == 0 {
-		for {
-			t.options.IPRoute2TableIndex = int(rand.Uint32())
-			routeList, fErr := netlink.RouteListFiltered(netlink.FAMILY_ALL, &netlink.Route{Table: t.options.IPRoute2TableIndex}, netlink.RT_FILTER_TABLE)
-			if len(routeList) == 0 || fErr != nil {
-				break
-			}
-		}
+	if t.options.EXP_ExternalConfiguration {
+		return nil
 	}
 
 	err = t.setRoute(tunLink)
@@ -315,6 +315,10 @@ func (t *NativeTun) Close() error {
 	if t.interfaceCallback != nil {
 		t.options.InterfaceMonitor.UnregisterCallback(t.interfaceCallback)
 	}
+	if t.options.EXP_ExternalConfiguration {
+		return common.Close(common.PtrOrNil(t.tunFile))
+	}
+	t.unsetAddresses()
 	return E.Errors(t.unsetRoute(), t.unsetRules(), common.Close(common.PtrOrNil(t.tunFile)))
 }
 
@@ -476,6 +480,9 @@ func prefixToIPNet(prefix netip.Prefix) *net.IPNet {
 func (t *NativeTun) UpdateRouteOptions(tunOptions Options) error {
 	if t.options.FileDescriptor > 0 {
 		return nil
+	} else if t.options.EXP_ExternalConfiguration {
+		t.options = tunOptions
+		return nil
 	} else if !t.options.AutoRoute {
 		t.options = tunOptions
 		return nil
@@ -613,6 +620,22 @@ func (t *NativeTun) rules() []*netlink.Rule {
 
 			it = netlink.NewRule()
 			it.Priority = priority6
+			it.Family = unix.AF_INET6
+			rules = append(rules, it)
+		}
+		// Fallback rules after system default rules (32766: main, 32767: default)
+		// Only reached when main and default tables have no route
+		if p4 {
+			it = netlink.NewRule()
+			it.Priority = t.options.IPRoute2AutoRedirectFallbackRuleIndex
+			it.Table = t.options.IPRoute2TableIndex
+			it.Family = unix.AF_INET
+			rules = append(rules, it)
+		}
+		if p6 {
+			it = netlink.NewRule()
+			it.Priority = t.options.IPRoute2AutoRedirectFallbackRuleIndex
+			it.Table = t.options.IPRoute2TableIndex
 			it.Family = unix.AF_INET6
 			rules = append(rules, it)
 		}
@@ -989,7 +1012,7 @@ func (t *NativeTun) unsetRules() error {
 		for _, rule := range ruleList {
 			ruleStart := t.options.IPRoute2RuleIndex
 			ruleEnd := ruleStart + 10
-			if rule.Priority >= ruleStart && rule.Priority <= ruleEnd {
+			if rule.Priority >= ruleStart && rule.Priority <= ruleEnd || (t.options.AutoRedirectMarkMode && rule.Priority == t.options.IPRoute2AutoRedirectFallbackRuleIndex) {
 				ruleToDel := netlink.NewRule()
 				ruleToDel.Family = rule.Family
 				ruleToDel.Priority = rule.Priority
@@ -1001,6 +1024,24 @@ func (t *NativeTun) unsetRules() error {
 		}
 	}
 	return nil
+}
+
+func (t *NativeTun) unsetAddresses() {
+	if t.options.FileDescriptor > 0 {
+		return
+	}
+	tunLink, err := netlink.LinkByName(t.options.Name)
+	if err != nil {
+		return
+	}
+	for _, address := range t.options.Inet4Address {
+		addr, _ := netlink.ParseAddr(address.String())
+		_ = netlink.AddrDel(tunLink, addr)
+	}
+	for _, address := range t.options.Inet6Address {
+		addr, _ := netlink.ParseAddr(address.String())
+		_ = netlink.AddrDel(tunLink, addr)
+	}
 }
 
 func (t *NativeTun) resetRules() error {
@@ -1045,4 +1086,16 @@ func (t *NativeTun) setSearchDomainForSystemdResolved() {
 		_ = shell.Exec(ctlPath, "default-route", t.options.Name, "true").Run()
 		_ = shell.Exec(ctlPath, append([]string{"dns", t.options.Name}, common.Map(dnsServer, netip.Addr.String)...)...).Run()
 	}()
+}
+
+func (t *NativeTun) disableReversePathFilter() error {
+	err := os.WriteFile("/proc/sys/net/ipv4/conf/all/rp_filter", []byte{'0'}, 0o644)
+	if err != nil {
+		return err
+	}
+	err = os.WriteFile("/proc/sys/net/ipv4/conf/"+t.options.Name+"/rp_filter", []byte{'0'}, 0o644)
+	if err != nil {
+		return err
+	}
+	return nil
 }
