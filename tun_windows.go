@@ -54,14 +54,38 @@ func New(options Options) (WinTun, error) {
 		}
 	})
 
-	// Try to open an existing adapter first, if it fails, create a new one
+	// Try to open an existing adapter first
+	var adapter *wintun.Adapter
 	adapter, err := wintun.OpenAdapter(options.Name) //karing
-	if err != nil {                                  //karing
-		// Adapter doesn't exist, create a new one
-		adapter, err = wintun.CreateAdapter(options.Name, TunnelType, generateGUIDByDeviceName(options.Name))
-		if err != nil {
-			return nil, E.Cause(err, "create") //karing
+	if err == nil {                                  //karing
+		// Adapter exists, but may be in a bad state. Close it first and recreate.
+		adapter.Close()
+		adapter = nil
+		// Give Windows time to clean up the adapter
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Create a new adapter (or recreate if previous one was closed)
+	// Retry up to 3 times if it fails due to adapter still existing
+	var createErr error      //karing
+	for i := 0; i < 3; i++ { //karing
+		adapter, createErr = wintun.CreateAdapter(options.Name, TunnelType, generateGUIDByDeviceName(options.Name))
+		if createErr == nil {
+			break
 		}
+
+		// If adapter already exists, try to open and close it again
+		if existingAdapter, openErr := wintun.OpenAdapter(options.Name); openErr == nil {
+			existingAdapter.Close()
+			time.Sleep(200 * time.Millisecond * time.Duration(i+1))
+		} else {
+			// Different error, stop retrying
+			break
+		}
+	}
+
+	if createErr != nil { //karing
+		return nil, E.Cause(createErr, "create adapter") //karing
 	}
 	nativeTun := &NativeTun{
 		adapter: adapter,
