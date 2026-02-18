@@ -53,9 +53,15 @@ func New(options Options) (WinTun, error) {
 			options.Logger.Info(message)
 		}
 	})
-	adapter, err := wintun.CreateAdapter(options.Name, TunnelType, generateGUIDByDeviceName(options.Name))
-	if err != nil {
-		return nil, E.Cause(err, "create") //karing
+
+	// Try to open an existing adapter first, if it fails, create a new one
+	adapter, err := wintun.OpenAdapter(options.Name) //karing
+	if err != nil {                                  //karing
+		// Adapter doesn't exist, create a new one
+		adapter, err = wintun.CreateAdapter(options.Name, TunnelType, generateGUIDByDeviceName(options.Name))
+		if err != nil {
+			return nil, E.Cause(err, "create") //karing
+		}
 	}
 	nativeTun := &NativeTun{
 		adapter: adapter,
