@@ -3,6 +3,9 @@
 package tun
 
 import (
+	"errors"
+	"syscall"
+
 	"github.com/sagernet/gvisor/pkg/buffer"
 	"github.com/sagernet/gvisor/pkg/tcpip"
 	gHdr "github.com/sagernet/gvisor/pkg/tcpip/header"
@@ -177,7 +180,7 @@ func (m *Mixed) batchLoopDarwin(darwinTUN DarwinTUN) {
 	for {
 		buffers, err := darwinTUN.BatchRead()
 		if err != nil {
-			if E.IsClosed(err) {
+			if E.IsClosed(err) || errors.Is(err, syscall.EBADF) {
 				return
 			}
 			m.logger.Error(E.Cause(err, "batch read packet"))
@@ -245,7 +248,7 @@ func (m *Mixed) processIPv4(ipHdr header.IPv4) (writeBack bool, err error) {
 		pkt.DecRef()
 		return
 	case header.ICMPv4ProtocolNumber:
-		err = m.processIPv4ICMP(ipHdr, ipHdr.Payload())
+		writeBack, err = m.processIPv4ICMP(ipHdr, ipHdr.Payload())
 	}
 	return
 }
@@ -267,7 +270,7 @@ func (m *Mixed) processIPv6(ipHdr header.IPv6) (writeBack bool, err error) {
 		m.endpoint.InjectInbound(tcpip.NetworkProtocolNumber(header.IPv6ProtocolNumber), pkt)
 		pkt.DecRef()
 	case header.ICMPv6ProtocolNumber:
-		err = m.processIPv6ICMP(ipHdr, ipHdr.Payload())
+		writeBack, err = m.processIPv6ICMP(ipHdr, ipHdr.Payload())
 	}
 	return
 }

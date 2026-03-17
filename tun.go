@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/control"
@@ -18,9 +19,19 @@ import (
 )
 
 type Handler interface {
-	PrepareConnection(network string, source M.Socksaddr, destination M.Socksaddr) error
+	PrepareConnection(
+		network string,
+		source M.Socksaddr,
+		destination M.Socksaddr,
+		routeContext DirectRouteContext,
+		timeout time.Duration,
+	) (DirectRouteDestination, error)
 	N.TCPConnectionHandlerEx
 	N.UDPConnectionHandlerEx
+}
+
+type DirectRouteContext interface {
+	WritePacket(packet []byte) error
 }
 
 type Tun interface {
@@ -74,6 +85,9 @@ type Options struct {
 	AutoRedirectMarkMode                  bool
 	AutoRedirectInputMark                 uint32
 	AutoRedirectOutputMark                uint32
+	AutoRedirectResetMark                 uint32
+	AutoRedirectNFQueue                   uint16
+	ExcludeMPTCP                          bool
 	Inet4LoopbackAddress                  []netip.Addr
 	Inet6LoopbackAddress                  []netip.Addr
 	StrictRoute                           bool
@@ -97,7 +111,8 @@ type Options struct {
 	_TXChecksumOffload bool
 
 	// For library usages.
-	EXP_DisableDNSHijack bool
+	EXP_DisableDNSHijack      bool
+	EXP_ExternalConfiguration bool
 
 	// For gvisor stack, it should be enabled when MTU is less than 32768; otherwise it should be less than or equal to 8192.
 	// The above condition is just an estimate and not exact, calculated on M4 pro.

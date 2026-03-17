@@ -13,34 +13,37 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
-	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/x/list"
 
 	"go4.org/netipx"
 )
 
 type autoRedirect struct {
-	tunOptions             *Options
-	ctx                    context.Context
-	handler                N.TCPConnectionHandlerEx
-	logger                 logger.Logger
-	tableName              string
-	networkMonitor         NetworkUpdateMonitor
-	networkListener        *list.Element[NetworkUpdateCallback]
-	interfaceFinder        control.InterfaceFinder
-	localAddresses         []netip.Prefix
-	customRedirectPortFunc func() int
-	customRedirectPort     int
-	redirectServer         *redirectServer
-	enableIPv4             bool
-	enableIPv6             bool
-	iptablesPath           string
-	ip6tablesPath          string
-	useNFTables            bool
-	androidSu              bool
-	suPath                 string
-	routeAddressSet        *[]*netipx.IPSet
-	routeExcludeAddressSet *[]*netipx.IPSet
+	tunOptions              *Options
+	ctx                     context.Context
+	handler                 Handler
+	logger                  logger.Logger
+	tableName               string
+	networkMonitor          NetworkUpdateMonitor
+	networkListener         *list.Element[NetworkUpdateCallback]
+	interfaceFinder         control.InterfaceFinder
+	localAddresses          []netip.Prefix
+	customRedirectPortFunc  func() int
+	customRedirectPort      int
+	redirectServer          *redirectServer
+	enableIPv4              bool
+	enableIPv6              bool
+	iptablesPath            string
+	ip6tablesPath           string
+	useNFTables             bool
+	androidSu               bool
+	suPath                  string
+	routeAddressSet         *[]*netipx.IPSet
+	routeExcludeAddressSet  *[]*netipx.IPSet
+	nfqueueHandler          *nfqueueHandler
+	nfqueueEnabled          bool
+	redirectRouteTableIndex int
+	redirectInterfaces      []control.Interface
 }
 
 func NewAutoRedirect(options AutoRedirectOptions) (AutoRedirect, error) {
@@ -125,24 +128,58 @@ func (r *autoRedirect) Start() error {
 			listenAddr = netip.IPv4Unspecified()
 		}
 		server := newRedirectServer(r.ctx, r.handler, r.logger, listenAddr)
-		err := server.Start()
+		err = server.Start()
 		if err != nil {
 			return E.Cause(err, "start redirect server")
 		}
 		r.redirectServer = server
 	}
 	if r.useNFTables {
+		var handler *nfqueueHandler
+		handler, err = newNFQueueHandler(nfqueueOptions{
+			Context:    r.ctx,
+			Handler:    r.handler,
+			Logger:     r.logger,
+			Queue:      r.effectiveNFQueue(),
+			OutputMark: r.effectiveOutputMark(),
+			ResetMark:  r.effectiveResetMark(),
+		})
+		if err != nil {
+			r.logger.Warn("nfqueue not available, pre-match disabled (missing nfnetlink_queue and nft_queue kernel module?): ", err)
+		} else if err = handler.Start(); err != nil {
+			r.logger.Warn("nfqueue start failed, pre-match disabled (missing nfnetlink_queue and nft_queue kernel module?): ", err)
+		} else {
+			r.nfqueueHandler = handler
+			r.nfqueueEnabled = true
+		}
 		r.cleanupNFTables()
 		err = r.setupNFTables()
+		if err != nil {
+			return E.Cause(err, "setup nftables")
+		}
+		if r.tunOptions.AutoRedirectMarkMode {
+			err = r.setupRedirectRoutes()
+			if err != nil {
+				r.cleanupNFTables()
+				return E.Cause(err, "setup redirect routes")
+			}
+		}
 	} else {
 		r.cleanupIPTables()
 		err = r.setupIPTables()
+		if err != nil {
+			return E.Cause(err, "setup iptables")
+		}
 	}
-	return err
+	return nil
 }
 
 func (r *autoRedirect) Close() error {
+	if r.nfqueueHandler != nil {
+		r.nfqueueHandler.Close()
+	}
 	if r.useNFTables {
+		r.cleanupRedirectRoutes()
 		r.cleanupNFTables()
 	} else {
 		r.cleanupIPTables()
@@ -180,4 +217,29 @@ func (r *autoRedirect) redirectPort() uint16 {
 		return uint16(r.customRedirectPort)
 	}
 	return M.AddrPortFromNet(r.redirectServer.listener.Addr()).Port()
+}
+
+func (r *autoRedirect) effectiveOutputMark() uint32 {
+	if r.tunOptions.AutoRedirectOutputMark != 0 {
+		return r.tunOptions.AutoRedirectOutputMark
+	}
+	return DefaultAutoRedirectOutputMark
+}
+
+func (r *autoRedirect) effectiveResetMark() uint32 {
+	if r.tunOptions.AutoRedirectResetMark != 0 {
+		return r.tunOptions.AutoRedirectResetMark
+	}
+	return DefaultAutoRedirectResetMark
+}
+
+func (r *autoRedirect) effectiveNFQueue() uint16 {
+	if r.tunOptions.AutoRedirectNFQueue != 0 {
+		return r.tunOptions.AutoRedirectNFQueue
+	}
+	return DefaultAutoRedirectNFQueue
+}
+
+func (r *autoRedirect) shouldSkipOutputChain() bool {
+	return len(r.tunOptions.IncludeInterface) > 0 && !common.Contains(r.tunOptions.IncludeInterface, "lo") || common.Contains(r.tunOptions.ExcludeInterface, "lo")
 }

@@ -3,6 +3,7 @@ package tun
 import (
 	"errors"
 	"fmt"
+	"math/rand"
 	"net"
 	"net/netip"
 	"os"
@@ -16,7 +17,6 @@ import (
 	"github.com/sagernet/sing-tun/internal/gtcpip/checksum"
 	"github.com/sagernet/sing-tun/internal/gtcpip/header"
 	"github.com/sagernet/sing/common"
-	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/rw"
@@ -39,6 +39,7 @@ type NativeTun struct {
 	writeAccess         sync.Mutex
 	vnetHdr             bool
 	writeBuffer         []byte
+	vnetHdrWriteBuf     []byte
 	gsoToWrite          []int
 	tcpGROTable         *tcpGROTable
 	udpGroAccess        sync.Mutex
@@ -52,7 +53,7 @@ func New(options Options) (Tun, error) {
 	if options.FileDescriptor == 0 {
 		tunFd, err := open(options.Name, options.GSO)
 		if err != nil {
-			return nil, err
+			return nil, E.Cause(err, "open tun")
 		}
 		tunLink, err := netlink.LinkByName(options.Name)
 		if err != nil {
@@ -92,12 +93,12 @@ func init() {
 func open(name string, vnetHdr bool) (int, error) {
 	fd, err := unix.Open(controlPath, unix.O_RDWR, 0)
 	if err != nil {
-		return -1, err
+		return -1, E.Cause(err, "open ", controlPath)
 	}
 	ifr, err := unix.NewIfreq(name)
 	if err != nil {
 		unix.Close(fd)
-		return 0, err
+		return 0, E.Cause(err, "create ifreq")
 	}
 	flags := unix.IFF_TUN | unix.IFF_NO_PI
 	if vnetHdr {
@@ -107,12 +108,12 @@ func open(name string, vnetHdr bool) (int, error) {
 	err = unix.IoctlIfreq(fd, unix.TUNSETIFF, ifr)
 	if err != nil {
 		unix.Close(fd)
-		return 0, err
+		return 0, E.Cause(err, "TUNSETIFF")
 	}
 	err = unix.SetNonblock(fd, true)
 	if err != nil {
 		unix.Close(fd)
-		return 0, err
+		return 0, E.Cause(err, "set nonblock")
 	}
 	return fd, nil
 }
@@ -122,24 +123,25 @@ func (t *NativeTun) configure(tunLink netlink.Link) error {
 	if errors.Is(err, unix.EPERM) {
 		return nil
 	} else if err != nil {
-		return err
+		return E.Cause(err, "set mtu")
 	}
-
-	if len(t.options.Inet4Address) > 0 {
-		for _, address := range t.options.Inet4Address {
-			addr4, _ := netlink.ParseAddr(address.String())
-			err = netlink.AddrAdd(tunLink, addr4)
-			if err != nil && !errors.Is(err, unix.EEXIST) {
-				return err
+	if !t.options.EXP_ExternalConfiguration {
+		if len(t.options.Inet4Address) > 0 {
+			for _, address := range t.options.Inet4Address {
+				addr4, _ := netlink.ParseAddr(address.String())
+				err = netlink.AddrAdd(tunLink, addr4)
+				if err != nil && !errors.Is(err, unix.EEXIST) {
+					return E.Cause(err, "add address ", address)
+				}
 			}
 		}
-	}
-	if len(t.options.Inet6Address) > 0 {
-		for _, address := range t.options.Inet6Address {
-			addr6, _ := netlink.ParseAddr(address.String())
-			err = netlink.AddrAdd(tunLink, addr6)
-			if err != nil && !errors.Is(err, unix.EEXIST) {
-				return err
+		if len(t.options.Inet6Address) > 0 {
+			for _, address := range t.options.Inet6Address {
+				addr6, _ := netlink.ParseAddr(address.String())
+				err = netlink.AddrAdd(tunLink, addr6)
+				if err != nil && !errors.Is(err, unix.EEXIST) {
+					return E.Cause(err, "add address ", address)
+				}
 			}
 		}
 	}
@@ -147,7 +149,9 @@ func (t *NativeTun) configure(tunLink netlink.Link) error {
 	if t.options.GSO {
 		err = t.enableGSO()
 		if err != nil {
-			t.options.Logger.Warn(err)
+			if t.options.Logger != nil {
+				t.options.Logger.Warn(err)
+			}
 		}
 	}
 
@@ -161,12 +165,12 @@ func (t *NativeTun) configure(tunLink netlink.Link) error {
 		var txChecksumOffload bool
 		txChecksumOffload, err = checkChecksumOffload(t.options.Name, unix.ETHTOOL_GTXCSUM)
 		if err != nil {
-			return err
+			return E.Cause(err, "check tx checksum offload")
 		}
 		if !txChecksumOffload {
 			err = setChecksumOffload(t.options.Name, unix.ETHTOOL_STXCSUM)
 			if err != nil {
-				return err
+				return E.Cause(err, "set tx checksum offload")
 			}
 		}
 		t.txChecksumOffload = true
@@ -235,7 +239,10 @@ func (t *NativeTun) probeTCPGRO() error {
 		tcpH.SetChecksum(^tcpH.CalculateChecksum(pseudoCsum))
 	}
 	_, err := t.BatchWrite(bufs, virtioNetHdrLen)
-	return err
+	if err != nil {
+		return E.Cause(err, "batch write")
+	}
+	return nil
 }
 
 func (t *NativeTun) Name() (string, error) {
@@ -253,22 +260,20 @@ func (t *NativeTun) Name() (string, error) {
 }
 
 func (t *NativeTun) Start() error {
-	err := t.disableReversePathFilter()
-	if err != nil && t.options.Logger != nil && t.options.FileDescriptor == 0 {
-		t.options.Logger.Warn(E.Cause(err, "disable reverse path filter"))
-	}
 	if t.options.FileDescriptor != 0 {
 		return nil
 	}
-	t.options.InterfaceMonitor.RegisterMyInterface(t.options.Name)
+	if !t.options.EXP_ExternalConfiguration {
+		t.options.InterfaceMonitor.RegisterMyInterface(t.options.Name)
+	}
 	tunLink, err := netlink.LinkByName(t.options.Name)
 	if err != nil {
-		return err
+		return E.Cause(err, "find tun interface")
 	}
 
 	err = netlink.LinkSetUp(tunLink)
 	if err != nil {
-		return err
+		return E.Cause(err, "set tun up")
 	}
 
 	if t.vnetHdr && len(t.options.Inet4Address) > 0 {
@@ -276,14 +281,30 @@ func (t *NativeTun) Start() error {
 		if err != nil {
 			t.gro.disableTCPGRO()
 			t.gro.disableUDPGRO()
-			t.options.Logger.Warn(E.Cause(err, "disabled TUN TCP & UDP GRO due to GRO probe error"))
+			if t.options.Logger != nil {
+				t.options.Logger.Warn(E.Cause(err, "disabled TUN TCP & UDP GRO due to GRO probe error"))
+			}
+		}
+	}
+
+	if t.options.EXP_ExternalConfiguration {
+		return nil
+	}
+
+	if t.options.IPRoute2TableIndex == 0 {
+		for {
+			t.options.IPRoute2TableIndex = int(rand.Uint32())
+			routeList, fErr := netlink.RouteListFiltered(netlink.FAMILY_ALL, &netlink.Route{Table: t.options.IPRoute2TableIndex}, netlink.RT_FILTER_TABLE)
+			if len(routeList) == 0 || fErr != nil {
+				break
+			}
 		}
 	}
 
 	err = t.setRoute(tunLink)
 	if err != nil {
 		_ = t.unsetRoute0(tunLink)
-		return err
+		return E.Cause(err, "set routes")
 	}
 
 	err = t.unsetRules()
@@ -293,7 +314,7 @@ func (t *NativeTun) Start() error {
 	err = t.setRules()
 	if err != nil {
 		_ = t.unsetRules()
-		return err
+		return E.Cause(err, "set rules")
 	}
 
 	t.setSearchDomainForSystemdResolved()
@@ -308,6 +329,10 @@ func (t *NativeTun) Close() error {
 	if t.interfaceCallback != nil {
 		t.options.InterfaceMonitor.UnregisterCallback(t.interfaceCallback)
 	}
+	if t.options.EXP_ExternalConfiguration {
+		return common.Close(common.PtrOrNil(t.tunFile))
+	}
+	t.unsetSearchDomainForSystemdResolved()
 	t.unsetAddresses()
 	return E.Errors(t.unsetRoute(), t.unsetRules(), common.Close(common.PtrOrNil(t.tunFile)))
 }
@@ -376,10 +401,7 @@ func handleVirtioRead(in []byte, bufs [][]byte, sizes []int, offset int) (int, e
 
 func (t *NativeTun) Write(p []byte) (n int, err error) {
 	if t.vnetHdr {
-		buffer := buf.Get(virtioNetHdrLen + len(p))
-		copy(buffer[virtioNetHdrLen:], p)
-		_, err = t.BatchWrite([][]byte{buffer}, virtioNetHdrLen)
-		buf.Put(buffer)
+		_, err = t.BatchWrite([][]byte{p}, virtioNetHdrLen)
 		if err != nil {
 			return
 		}
@@ -470,17 +492,20 @@ func prefixToIPNet(prefix netip.Prefix) *net.IPNet {
 func (t *NativeTun) UpdateRouteOptions(tunOptions Options) error {
 	if t.options.FileDescriptor > 0 {
 		return nil
+	} else if t.options.EXP_ExternalConfiguration {
+		t.options = tunOptions
+		return nil
 	} else if !t.options.AutoRoute {
 		t.options = tunOptions
 		return nil
 	}
 	tunLink, err := netlink.LinkByName(t.options.Name)
 	if err != nil {
-		return err
+		return E.Cause(err, "find tun interface")
 	}
 	err = t.unsetRoute0(tunLink)
 	if err != nil {
-		return err
+		return E.Cause(err, "unset old routes")
 	}
 	t.options = tunOptions
 	return t.setRoute(tunLink)
@@ -489,7 +514,7 @@ func (t *NativeTun) UpdateRouteOptions(tunOptions Options) error {
 func (t *NativeTun) routes(tunLink netlink.Link) ([]netlink.Route, error) {
 	routeRanges, err := t.options.BuildAutoRouteRanges(false)
 	if err != nil {
-		return nil, err
+		return nil, E.Cause(err, "build auto route ranges")
 	}
 	// Do not create gateway on linux by default
 	gateway4, gateway6 := t.options.Inet4GatewayAddr(), t.options.Inet6GatewayAddr()
@@ -934,7 +959,7 @@ func (t *NativeTun) rules() []*netlink.Rule {
 func (t *NativeTun) setRoute(tunLink netlink.Link) error {
 	routes, err := t.routes(tunLink)
 	if err != nil {
-		return err
+		return E.Cause(err, "build routes")
 	}
 	for i, route := range routes {
 		err := netlink.RouteAdd(&route)
@@ -961,7 +986,7 @@ func (t *NativeTun) unsetRoute() error {
 	}
 	tunLink, err := netlink.LinkByName(t.options.Name)
 	if err != nil {
-		return err
+		return E.Cause(err, "find tun interface")
 	}
 	return t.unsetRoute0(tunLink)
 }
@@ -994,7 +1019,7 @@ func (t *NativeTun) unsetRules() error {
 	if t.options.AutoRoute {
 		ruleList, err := netlink.RuleList(netlink.FAMILY_ALL)
 		if err != nil {
-			return err
+			return E.Cause(err, "list rules")
 		}
 		for _, rule := range ruleList {
 			ruleStart := t.options.IPRoute2RuleIndex
@@ -1075,14 +1100,13 @@ func (t *NativeTun) setSearchDomainForSystemdResolved() {
 	}()
 }
 
-func (t *NativeTun) disableReversePathFilter() error {
-	err := os.WriteFile("/proc/sys/net/ipv4/conf/all/rp_filter", []byte{'0'}, 0o644)
-	if err != nil {
-		return err
+func (t *NativeTun) unsetSearchDomainForSystemdResolved() {
+	if t.options.EXP_DisableDNSHijack {
+		return
 	}
-	err = os.WriteFile("/proc/sys/net/ipv4/conf/"+t.options.Name+"/rp_filter", []byte{'0'}, 0o644)
+	ctlPath, err := exec.LookPath("resolvectl")
 	if err != nil {
-		return err
+		return
 	}
-	return nil
+	_ = shell.Exec(ctlPath, "revert", t.options.Name).Run()
 }
