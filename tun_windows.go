@@ -206,10 +206,6 @@ func (t *NativeTun) Name() (string, error) {
 	return t.options.Name, nil
 }
 
-func (t *NativeTun) MTU() (int32, error) {
-	return int32(t.options.MTU), nil //karing
-}
-
 func (t *NativeTun) Start() error {
 	if t.options.EXP_ExternalConfiguration || !t.options.AutoRoute {
 		return nil
