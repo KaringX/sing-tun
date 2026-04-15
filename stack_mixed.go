@@ -12,7 +12,7 @@ import (
 	"github.com/sagernet/gvisor/pkg/tcpip/link/channel"
 	"github.com/sagernet/gvisor/pkg/tcpip/stack"
 	"github.com/sagernet/gvisor/pkg/tcpip/transport/udp"
-	"github.com/sagernet/sing-tun/internal/gtcpip/header"
+	"github.com/sagernet/sing-tun/gtcpip/header"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
 )
@@ -184,6 +184,7 @@ func (m *Mixed) batchLoopDarwin(darwinTUN DarwinTUN) {
 		for _, buffer := range buffers {
 			packetSize := buffer.Len()
 			if packetSize < header.IPv4MinimumSize {
+				buffer.Release()
 				continue
 			}
 			if m.processPacket(buffer.Bytes()) {
@@ -197,6 +198,7 @@ func (m *Mixed) batchLoopDarwin(darwinTUN DarwinTUN) {
 			if err != nil {
 				m.logger.Trace(E.Cause(err, "batch write packet"))
 			}
+			buf.ReleaseMulti(writeBuffers)
 		}
 	}
 }
