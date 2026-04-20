@@ -53,12 +53,18 @@ func (t *NativeTun) WritePacket(pkt *stack.PacketBuffer) (int, error) {
 	}
 	var dataLen int
 	for _, packetSlice := range pkt.AsSlices() {
+		if len(packetSlice) == 0 { //karing
+			continue
+		}
 		dataLen += len(packetSlice)
 		iovec := unix.Iovec{
 			Base: &packetSlice[0],
 		}
 		iovec.SetLen(len(packetSlice))
 		iovecs = append(iovecs, iovec)
+	}
+	if dataLen == 0 { //karing
+		return 0, nil
 	}
 	if cap(iovecs) > cap(t.iovecsOutputDefault) {
 		t.iovecsOutputDefault = iovecs[:0]
