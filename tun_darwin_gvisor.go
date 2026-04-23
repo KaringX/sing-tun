@@ -15,7 +15,10 @@ import (
 var _ GVisorTun = (*NativeTun)(nil)
 
 func (t *NativeTun) WritePacket(pkt *stack.PacketBuffer) (int, error) {
-	iovecs := t.iovecsOutputDefault
+	t.writePacketAccess.Lock()         //karing
+	defer t.writePacketAccess.Unlock() //karing
+
+	iovecs := t.iovecsOutputDefault[:0] //karing
 	if pkt.NetworkProtocolNumber == header.IPv4ProtocolNumber {
 		iovecs = append(iovecs, packetHeaderVec4)
 	} else {
@@ -36,9 +39,9 @@ func (t *NativeTun) WritePacket(pkt *stack.PacketBuffer) (int, error) {
 	if dataLen == 0 { //karing
 		return 0, nil
 	}
-	if cap(iovecs) > cap(t.iovecsOutputDefault) {
-		t.iovecsOutputDefault = iovecs[:0]
-	}
+	//if cap(iovecs) > cap(t.iovecsOutputDefault) { //karing
+	t.iovecsOutputDefault = iovecs[:0]
+	//} //karing
 	errno := rawfile.NonBlockingWriteIovec(t.tunFd, iovecs)
 	if errno == 0 {
 		return dataLen, nil

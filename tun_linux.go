@@ -37,6 +37,7 @@ type NativeTun struct {
 	ruleIndex6          []int
 	readAccess          sync.Mutex
 	writeAccess         sync.Mutex
+	writePacketAccess   sync.Mutex //karing
 	vnetHdr             bool
 	writeBuffer         []byte
 	vnetHdrWriteBuf     []byte

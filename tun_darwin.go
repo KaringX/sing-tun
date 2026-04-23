@@ -6,12 +6,13 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"sync"
 	"syscall"
 	"unsafe"
 
 	"github.com/sagernet/sing-tun/internal/gtcpip/header"
-	"github.com/sagernet/sing-tun/internal/rawfile_darwin"
-	"github.com/sagernet/sing-tun/internal/stopfd_darwin"
+	rawfile "github.com/sagernet/sing-tun/internal/rawfile_darwin"
+	stopfd "github.com/sagernet/sing-tun/internal/stopfd_darwin"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -41,6 +42,7 @@ type NativeTun struct {
 	inet6Address        [16]byte
 	routeSet            bool
 	sendMsgX            bool
+	writePacketAccess   sync.Mutex //karing
 }
 
 type iovecBuffer struct {
