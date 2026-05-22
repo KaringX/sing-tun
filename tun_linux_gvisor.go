@@ -13,7 +13,8 @@ import (
 )
 
 func init() {
-	fdbased.BufConfig = []int{65535}
+	// Use tiered buffers so small packets do not allocate a full 64KiB view.
+	fdbased.BufConfig = []int{128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768} // karing
 }
 
 var _ GVisorTun = (*NativeTun)(nil)
