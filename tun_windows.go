@@ -16,7 +16,6 @@ import (
 	"github.com/sagernet/sing-tun/internal/winipcfg"
 	"github.com/sagernet/sing-tun/internal/winsys"
 	"github.com/sagernet/sing-tun/internal/wintun"
-	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/windnsapi"
 
@@ -43,7 +42,14 @@ func New(options Options) (WinTun, error) {
 	}
 	adapter, err := wintun.CreateAdapter(options.Name, TunnelType, generateGUIDByDeviceName(options.Name))
 	if err != nil {
-		return nil, err
+		if !errors.Is(err, os.ErrExist) {
+			return nil, err
+		}
+		createErr := err
+		adapter, err = wintun.OpenAdapter(options.Name)
+		if err != nil {
+			return nil, E.Errors(E.Cause(createErr, "create adapter"), E.Cause(err, "open existing adapter"))
+		}
 	}
 	nativeTun := &NativeTun{
 		adapter: adapter,
@@ -74,16 +80,14 @@ func (t *NativeTun) configure() error {
 		if err != nil {
 			return E.Cause(err, "set ipv4 address")
 		}
-		if t.options.AutoRoute && !t.options.EXP_DisableDNSHijack {
-			dnsServers := common.Filter(t.options.DNSServers, netip.Addr.Is4)
-			if len(dnsServers) == 0 && HasNextAddress(t.options.Inet4Address[0], 1) {
-				dnsServers = []netip.Addr{t.options.Inet4Address[0].Addr().Next()}
+		if t.options.AutoRoute && t.options.DNSModeOrDefault() != DNSModeDisabled {
+			dnsServers, err := t.options.Inet4DNSAddress()
+			if err != nil {
+				return err
 			}
-			if len(dnsServers) > 0 {
-				err = luid.SetDNS(winipcfg.AddressFamily(windows.AF_INET), dnsServers, nil)
-				if err != nil {
-					return E.Cause(err, "set ipv4 dns")
-				}
+			err = luid.SetDNS(winipcfg.AddressFamily(windows.AF_INET), dnsServers, nil)
+			if err != nil {
+				return E.Cause(err, "set ipv4 dns")
 			}
 		} else {
 			err = luid.SetDNS(winipcfg.AddressFamily(windows.AF_INET), nil, nil)
@@ -97,16 +101,14 @@ func (t *NativeTun) configure() error {
 		if err != nil {
 			return E.Cause(err, "set ipv6 address")
 		}
-		if t.options.AutoRoute && !t.options.EXP_DisableDNSHijack {
-			dnsServers := common.Filter(t.options.DNSServers, netip.Addr.Is6)
-			if len(dnsServers) == 0 && HasNextAddress(t.options.Inet6Address[0], 1) {
-				dnsServers = []netip.Addr{t.options.Inet6Address[0].Addr().Next()}
+		if t.options.AutoRoute && t.options.DNSModeOrDefault() != DNSModeDisabled {
+			dnsServers, err := t.options.Inet6DNSAddress()
+			if err != nil {
+				return err
 			}
-			if len(dnsServers) > 0 {
-				err = luid.SetDNS(winipcfg.AddressFamily(windows.AF_INET6), dnsServers, nil)
-				if err != nil {
-					return E.Cause(err, "set ipv6 dns")
-				}
+			err = luid.SetDNS(winipcfg.AddressFamily(windows.AF_INET6), dnsServers, nil)
+			if err != nil {
+				return E.Cause(err, "set ipv6 dns")
 			}
 		} else {
 			err = luid.SetDNS(winipcfg.AddressFamily(windows.AF_INET6), nil, nil)
@@ -327,7 +329,7 @@ func (t *NativeTun) Start() error {
 			}
 		}
 
-		if !t.options.EXP_DisableDNSHijack {
+		if t.options.DNSModeOrDefault() == DNSModeHijack {
 			blockDNSCondition := make([]winsys.FWPM_FILTER_CONDITION0, 1)
 			blockDNSCondition[0].FieldKey = winsys.FWPM_CONDITION_IP_REMOTE_PORT
 			blockDNSCondition[0].MatchType = winsys.FWP_MATCH_EQUAL
