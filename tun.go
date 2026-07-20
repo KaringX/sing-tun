@@ -7,7 +7,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
@@ -21,19 +20,10 @@ import (
 )
 
 type Handler interface {
-	PrepareConnection(
-		network string,
-		source M.Socksaddr,
-		destination M.Socksaddr,
-		routeContext DirectRouteContext,
-		timeout time.Duration,
-	) (DirectRouteDestination, error)
+	JudgeFlow(network uint8, source netip.AddrPort, destination netip.AddrPort, firstPacket []byte) FlowVerdict
+	NewDNSPacket(payload []byte, source M.Socksaddr, destination M.Socksaddr, writer N.PacketWriter)
 	N.TCPConnectionHandlerEx
 	N.UDPConnectionHandlerEx
-}
-
-type DirectRouteContext interface {
-	WritePacket(packet []byte) error
 }
 
 type Tun interface {
@@ -78,6 +68,7 @@ const (
 
 type Options struct {
 	Name                                  string
+	NetNs                                 string
 	Inet4Address                          []netip.Prefix
 	Inet6Address                          []netip.Prefix
 	MTU                                   uint32
@@ -237,7 +228,7 @@ func (o *Options) Inet6GatewayAddr() netip.Addr {
 }
 
 func CalculateInterfaceName(name string) (tunName string) {
-	if runtime.GOOS == "darwin" {
+	if runtime.GOOS == "darwin" || runtime.GOOS == "ios" {
 		tunName = "utun"
 	} else if name != "" {
 		tunName = name

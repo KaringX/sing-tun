@@ -35,6 +35,9 @@
 // only use the first FD to write outbound packets. Once 5 tuple hashes for
 // all outbound packets are available we will make use of all underlying FD's to
 // write outbound packets.
+
+//go:build darwin
+
 package fdbased
 
 import (
@@ -46,8 +49,7 @@ import (
 	"github.com/sagernet/gvisor/pkg/tcpip"
 	"github.com/sagernet/gvisor/pkg/tcpip/header"
 	"github.com/sagernet/gvisor/pkg/tcpip/stack"
-	"github.com/sagernet/sing-tun/internal/rawfile_darwin"
-	"github.com/sagernet/sing/common"
+	rawfile "github.com/sagernet/sing-tun/internal/rawfile_darwin"
 
 	"golang.org/x/sys/unix"
 )
@@ -298,7 +300,7 @@ func New(opts *Options) (stack.LinkEndpoint, error) {
 
 		e.fds = append(e.fds, fdInfo{fd: fd, isSocket: true})
 		if opts.ProcessorsPerChannel == 0 {
-			opts.ProcessorsPerChannel = common.Max(1, runtime.GOMAXPROCS(0)/len(opts.FDs))
+			opts.ProcessorsPerChannel = max(1, runtime.GOMAXPROCS(0)/len(opts.FDs))
 		}
 
 		inboundDispatcher, err := newRecvMMsgDispatcher(fd, e, opts)

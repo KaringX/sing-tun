@@ -6,12 +6,13 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"sync"
 	"syscall"
 	"unsafe"
 
 	"github.com/sagernet/sing-tun/gtcpip/header"
-	"github.com/sagernet/sing-tun/internal/rawfile_darwin"
-	"github.com/sagernet/sing-tun/internal/stopfd_darwin"
+	rawfile "github.com/sagernet/sing-tun/internal/rawfile_darwin"
+	stopfd "github.com/sagernet/sing-tun/internal/stopfd_darwin"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -36,6 +37,8 @@ type NativeTun struct {
 	msgHdrsOutput       []rawfile.MsgHdrX
 	buffers             []*buf.Buffer
 	stopFd              stopfd.StopFD
+	readPoller          *rawfile.Poller
+	writeAccess         sync.Mutex
 	options             Options
 	inet4Address        [4]byte
 	inet6Address        [16]byte
@@ -132,7 +135,8 @@ func New(options Options) (Tun, error) {
 		stopFd:        common.Must1(stopfd.New()),
 		sendMsgX:      options.EXP_SendMsgX,
 	}
-	for i := 0; i < batchSize; i++ {
+	nativeTun.readPoller = common.Must1(rawfile.NewPoller(nativeTun.stopFd.ReadFD, tunFd))
+	for i := range batchSize {
 		nativeTun.iovecs[i] = newIovecBuffer(int(options.MTU))
 		nativeTun.iovecsOutput[i] = newIovecBuffer(int(options.MTU))
 	}
@@ -155,13 +159,24 @@ func (t *NativeTun) Start() error {
 
 func (t *NativeTun) Close() error {
 	if t.options.EXP_ExternalConfiguration {
-		return t.tunFile.Close()
+		t.stopFd.Stop()
+		err := t.tunFile.Close()
+		t.closePollers()
+		t.stopFd.Close()
+		return err
 	}
 	defer flushDNSCache()
 	t.stopFd.Stop()
 	err := E.Errors(t.unsetRoutes(), t.tunFile.Close())
+	t.closePollers()
 	t.stopFd.Close()
 	return err
+}
+
+func (t *NativeTun) closePollers() {
+	if t.readPoller != nil {
+		_ = t.readPoller.Close()
+	}
 }
 
 func (t *NativeTun) Read(p []byte) (n int, err error) {
@@ -350,9 +365,9 @@ func (t *NativeTun) BatchRead() ([]*buf.Buffer, error) {
 		t.msgHdrs[i].Msg.Iov = &iovecs[0]
 		t.msgHdrs[i].Msg.Iovlen = 2
 	}
-	n, errno := rawfile.BlockingRecvMMsgUntilStopped(t.stopFd.ReadFD, t.tunFd, t.msgHdrs)
+	n, errno := rawfile.BlockingRecvMMsgUntilStopped(t.readPoller, t.tunFd, t.msgHdrs)
 	if errno != 0 {
-		for k := 0; k < n; k++ {
+		for k := range n {
 			t.iovecs[k].buffer.Release()
 			t.iovecs[k].buffer = nil
 		}
@@ -366,7 +381,7 @@ func (t *NativeTun) BatchRead() ([]*buf.Buffer, error) {
 		return nil, nil
 	}
 	buffers := t.buffers
-	for k := 0; k < n; k++ {
+	for k := range n {
 		buffer := t.iovecs[k].buffer
 		t.iovecs[k].buffer = nil
 		buffer.Truncate(int(t.msgHdrs[k].DataLen) - PacketOffset)
@@ -377,6 +392,23 @@ func (t *NativeTun) BatchRead() ([]*buf.Buffer, error) {
 }
 
 func (t *NativeTun) BatchWrite(buffers []*buf.Buffer) error {
+	t.writeAccess.Lock()
+	defer t.writeAccess.Unlock()
+	for len(buffers) > 0 {
+		chunk := buffers
+		if len(chunk) > t.batchSize {
+			chunk = chunk[:t.batchSize]
+		}
+		buffers = buffers[len(chunk):]
+		err := t.batchWriteChunk(chunk)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *NativeTun) batchWriteChunk(buffers []*buf.Buffer) error {
 	if !t.sendMsgX {
 		for i, buffer := range buffers {
 			t.iovecsOutput[i].nextIovecsOutput(buffer)

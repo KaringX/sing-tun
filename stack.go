@@ -12,14 +12,9 @@ import (
 	"github.com/sagernet/sing/common/logger"
 )
 
-var (
-	ErrDrop   = E.New("drop by rule")
-	ErrReset  = E.New("reset by rule")
-	ErrBypass = E.New("bypass by rule")
-)
-
 type Stack interface {
 	Start() error
+	ResetNetwork()
 	Close() error
 }
 
@@ -29,6 +24,9 @@ type StackOptions struct {
 	TunOptions             Options
 	UDPTimeout             time.Duration
 	ICMPTimeout            time.Duration
+	UDPMapping             NATMapping
+	UDPFiltering           NATFiltering
+	UDPNATMax              uint32
 	Handler                Handler
 	Logger                 logger.Logger
 	ForwarderBindInterface bool
@@ -68,7 +66,7 @@ func NewStack(
 
 func HasNextAddress(prefix netip.Prefix, count int) bool {
 	checkAddr := prefix.Addr()
-	for i := 0; i < count; i++ {
+	for range count {
 		checkAddr = checkAddr.Next()
 	}
 	return prefix.Contains(checkAddr)

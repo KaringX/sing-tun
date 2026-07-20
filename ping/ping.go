@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"reflect"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -21,20 +22,27 @@ import (
 )
 
 type Conn struct {
-	ctx         context.Context
-	privileged  bool
-	conn        net.Conn
-	destination netip.Addr
-	source      common.TypedValue[netip.Addr]
-	closed      atomic.Bool
-	readMsg     func(b, oob []byte) (n, oobn int, addr netip.Addr, err error)
+	ctx          context.Context
+	privileged   bool
+	conn         net.Conn
+	controlConn  net.Conn
+	destination  netip.Addr
+	source       common.TypedValue[netip.Addr]
+	closed       atomic.Bool
+	identFilter  identFilterState
+	readMsg      func(b, oob []byte) (n, oobn int, addr netip.Addr, err error)
+	writeAccess  sync.Mutex
+	lastTTL      int
+	lastHopLimit int
 }
 
 func Connect(ctx context.Context, privileged bool, controlFunc control.Func, destination netip.Addr, idleTimeout time.Duration) (*Conn, error) {
 	c := &Conn{
-		ctx:         ctx,
-		privileged:  privileged,
-		destination: destination,
+		ctx:          ctx,
+		privileged:   privileged,
+		destination:  destination,
+		lastTTL:      -1,
+		lastHopLimit: -1,
 	}
 	err := c.connect(controlFunc, idleTimeout)
 	if err != nil {
@@ -53,6 +61,7 @@ func (c *Conn) connect(controlFunc control.Func, idleTimeout time.Duration) (err
 		return err
 	}
 	if ipConn, isIPConn := common.Cast[*net.IPConn](c.conn); isIPConn {
+		c.controlConn = ipConn
 		c.readMsg = func(b, oob []byte) (n, oobn int, addr netip.Addr, err error) {
 			var ipAddr *net.IPAddr
 			n, oobn, _, ipAddr, err = ipConn.ReadMsgIP(b, oob)
@@ -62,6 +71,7 @@ func (c *Conn) connect(controlFunc control.Func, idleTimeout time.Duration) (err
 			return
 		}
 	} else if udpConn, isUDPConn := common.Cast[*net.UDPConn](c.conn); isUDPConn {
+		c.controlConn = udpConn
 		c.readMsg = func(b, oob []byte) (n, oobn int, addr netip.Addr, err error) {
 			var addrPort netip.AddrPort
 			n, oobn, _, addrPort, err = udpConn.ReadMsgUDPAddrPort(b, oob)
@@ -158,9 +168,19 @@ func (c *Conn) ReadIP(buffer *buf.Buffer) error {
 			})
 		}
 	} else {
-		_, err := buffer.ReadOnceFrom(c.conn)
-		if err != nil {
-			return err
+		if runtime.GOOS == "linux" || runtime.GOOS == "android" || runtime.GOOS == "windows" {
+			// An unconnected SOCK_RAW IPv4 socket delivers the full packet including the IP
+			// header via ReadMsgIP, whereas ReadFrom strips it.
+			n, _, _, err := c.readMsg(buffer.FreeBytes(), nil)
+			if err != nil {
+				return err
+			}
+			buffer.Truncate(n)
+		} else {
+			_, err := buffer.ReadOnceFrom(c.conn)
+			if err != nil {
+				return err
+			}
 		}
 		if !c.destination.Is6() {
 			ipHdr := header.IPv4(buffer.Bytes())
@@ -177,10 +197,12 @@ func (c *Conn) ReadIP(buffer *buf.Buffer) error {
 			ipHdr.SetDestinationAddr(c.source.Load())
 			ipHdr.SetChecksum(^ipHdr.CalculateChecksum())
 			icmpHdr := header.ICMPv4(ipHdr.Payload())
-			if !c.isLinuxUnprivileged() {
-				icmpHdr.SetIdent(^icmpHdr.Ident())
+			if icmpHdr.Type() == header.ICMPv4EchoReply {
+				if !c.isLinuxUnprivileged() {
+					icmpHdr.SetIdent(^icmpHdr.Ident())
+				}
+				icmpHdr.SetChecksum(header.ICMPv4Checksum(icmpHdr, 0))
 			}
-			icmpHdr.SetChecksum(header.ICMPv4Checksum(icmpHdr, 0))
 		} else {
 			ipHdr := header.IPv6(buffer.Bytes())
 			if !ipHdr.IsValid(buffer.Len()) {
@@ -202,45 +224,78 @@ func (c *Conn) ReadIP(buffer *buf.Buffer) error {
 }
 
 func (c *Conn) ReadICMP(buffer *buf.Buffer) error {
+	if !c.isLinuxUnprivileged() && !c.destination.Is6() {
+		if runtime.GOOS == "linux" || runtime.GOOS == "android" || runtime.GOOS == "windows" {
+			// An unconnected SOCK_RAW IPv4 socket delivers the full packet including the IP
+			// header via ReadMsgIP, whereas ReadFrom strips it.
+			n, _, _, err := c.readMsg(buffer.FreeBytes(), nil)
+			if err != nil {
+				return err
+			}
+			buffer.Truncate(n)
+		} else {
+			_, err := buffer.ReadOnceFrom(c.conn)
+			if err != nil {
+				return err
+			}
+		}
+		ipHdr := header.IPv4(buffer.Bytes())
+		buffer.Advance(int(ipHdr.HeaderLength()))
+
+		icmpHdr := header.ICMPv4(buffer.Bytes())
+		icmpHdr.SetIdent(^icmpHdr.Ident())
+		icmpHdr.SetChecksum(header.ICMPv4Checksum(icmpHdr, 0))
+		return nil
+	}
 	_, err := buffer.ReadOnceFrom(c.conn)
 	if err != nil {
 		return err
 	}
-	if !c.isLinuxUnprivileged() {
-		if !c.destination.Is6() {
-			ipHdr := header.IPv4(buffer.Bytes())
-			buffer.Advance(int(ipHdr.HeaderLength()))
-
-			icmpHdr := header.ICMPv4(buffer.Bytes())
-			icmpHdr.SetIdent(^icmpHdr.Ident())
-			icmpHdr.SetChecksum(header.ICMPv4Checksum(icmpHdr, 0))
-		} else {
-			icmpHdr := header.ICMPv6(buffer.Bytes())
-			icmpHdr.SetIdent(^icmpHdr.Ident())
-			icmpHdr.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
-				Header: icmpHdr,
-				Src:    c.destination.AsSlice(),
-				Dst:    c.source.Load().AsSlice(),
-			}))
-		}
+	if c.destination.Is6() && !c.isLinuxUnprivileged() {
+		icmpHdr := header.ICMPv6(buffer.Bytes())
+		icmpHdr.SetIdent(^icmpHdr.Ident())
+		icmpHdr.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+			Header: icmpHdr,
+			Src:    c.destination.AsSlice(),
+			Dst:    c.source.Load().AsSlice(),
+		}))
 	}
 	return nil
 }
 
 func (c *Conn) WriteIP(buffer *buf.Buffer) error {
 	defer buffer.Release()
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
 	if !c.destination.Is6() {
 		ipHdr := header.IPv4(buffer.Bytes())
 		if !c.isLinuxUnprivileged() {
+			ttl := int(ipHdr.TTL())
+			if ttl != c.lastTTL {
+				err := ipv4.NewConn(c.controlConn).SetTTL(ttl)
+				if err != nil {
+					return err
+				}
+				c.lastTTL = ttl
+			}
 			icmpHdr := header.ICMPv4(ipHdr.Payload())
 			icmpHdr.SetIdent(^icmpHdr.Ident())
 			icmpHdr.SetChecksum(header.ICMPv4Checksum(icmpHdr, 0))
+			c.updateIdentFilter(icmpHdr.Ident())
 		}
 		c.source.Store(M.AddrFromIP(ipHdr.SourceAddressSlice()))
 		return common.Error(c.conn.Write(ipHdr.Payload()))
 	} else {
 		ipHdr := header.IPv6(buffer.Bytes())
 		if !c.isLinuxUnprivileged() {
+			hopLimit := int(ipHdr.HopLimit())
+			if hopLimit != c.lastHopLimit {
+				err := ipv6.NewConn(c.controlConn).SetHopLimit(hopLimit)
+				if err != nil {
+					return err
+				}
+				c.lastHopLimit = hopLimit
+			}
 			icmpHdr := header.ICMPv6(ipHdr.Payload())
 			icmpHdr.SetIdent(^icmpHdr.Ident())
 			icmpHdr.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
@@ -248,6 +303,7 @@ func (c *Conn) WriteIP(buffer *buf.Buffer) error {
 				Src:    ipHdr.SourceAddressSlice(),
 				Dst:    ipHdr.DestinationAddressSlice(),
 			}))
+			c.updateIdentFilter(icmpHdr.Ident())
 		}
 		c.source.Store(M.AddrFromIP(ipHdr.SourceAddressSlice()))
 		return common.Error(c.conn.Write(ipHdr.Payload()))

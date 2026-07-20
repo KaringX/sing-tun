@@ -4,6 +4,7 @@ package tun
 
 import (
 	"bytes"
+	"slices"
 	"strings"
 
 	"github.com/sagernet/nftables"
@@ -141,12 +142,7 @@ func nftablesDockerFirewallEventsRelevant(events *nftables.MonitorEvents) bool {
 	if events == nil {
 		return false
 	}
-	for _, event := range events.Changes {
-		if nftablesDockerFirewallEventRelevant(event) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(events.Changes, nftablesDockerFirewallEventRelevant)
 }
 
 func nftablesDockerFirewallEventRelevant(event *nftables.MonitorEvent) bool {
