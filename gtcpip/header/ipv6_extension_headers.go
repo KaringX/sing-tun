@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"math"
 
-	tcpip "github.com/sagernet/sing-tun/gtcpip"
+	"github.com/sagernet/sing-tun/gtcpip"
 )
 
 // IPv6ExtensionHeaderIdentifier is an IPv6 extension header identifier.

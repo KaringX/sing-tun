@@ -20,7 +20,7 @@ import (
 	"net/netip"
 	"time"
 
-	tcpip "github.com/sagernet/sing-tun/gtcpip"
+	"github.com/sagernet/sing-tun/gtcpip"
 	"github.com/sagernet/sing-tun/gtcpip/checksum"
 )
 

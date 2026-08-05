@@ -23,7 +23,7 @@ import (
 	"math"
 	"time"
 
-	tcpip "github.com/sagernet/sing-tun/gtcpip"
+	"github.com/sagernet/sing-tun/gtcpip"
 )
 
 // ndpOptionIdentifier is an NDP option type identifier.

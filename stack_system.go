@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/sagernet/gvisor/pkg/tcpip"
+	"github.com/sagernet/sing-tun/gtcpip"
 	"github.com/sagernet/sing-tun/gtcpip/checksum"
 	"github.com/sagernet/sing-tun/gtcpip/header"
 	"github.com/sagernet/sing/common"
