@@ -43,6 +43,7 @@ type defaultInterfaceMonitor struct {
 	noRoute               atomic.Bool
 	networkMonitor        NetworkUpdateMonitor
 	logger                logger.Logger
+	checkAccess           sync.Mutex
 	checkUpdateTimer      *time.Timer
 	element               *list.Element[NetworkUpdateCallback]
 	access                sync.Mutex
@@ -61,8 +62,8 @@ func NewDefaultInterfaceMonitor(networkMonitor NetworkUpdateMonitor, logger logg
 }
 
 func (m *defaultInterfaceMonitor) Start() error {
-	m.postCheckUpdate()
 	m.element = m.networkMonitor.RegisterCallback(m.delayCheckUpdate)
+	m.postCheckUpdate()
 	return nil
 }
 
@@ -77,9 +78,12 @@ func (m *defaultInterfaceMonitor) delayCheckUpdate() {
 }
 
 func (m *defaultInterfaceMonitor) postCheckUpdate() {
+	m.checkAccess.Lock()
+	defer m.checkAccess.Unlock()
 	err := m.interfaceFinder.Update()
 	if err != nil {
 		m.logger.Error("update interface: ", err)
+		m.delayCheckUpdate()
 		return
 	}
 	err = m.checkUpdate()
@@ -91,6 +95,7 @@ func (m *defaultInterfaceMonitor) postCheckUpdate() {
 		}
 	} else if err != nil {
 		m.logger.Error("check interface: ", err)
+		m.delayCheckUpdate()
 	} else {
 		m.noRoute.Store(false)
 	}
