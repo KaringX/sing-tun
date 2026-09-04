@@ -7,10 +7,11 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"time"
 
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/control"
+	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -19,19 +20,10 @@ import (
 )
 
 type Handler interface {
-	PrepareConnection(
-		network string,
-		source M.Socksaddr,
-		destination M.Socksaddr,
-		routeContext DirectRouteContext,
-		timeout time.Duration,
-	) (DirectRouteDestination, error)
+	JudgeFlow(network uint8, source netip.AddrPort, destination netip.AddrPort, firstPacket []byte) FlowVerdict
+	NewDNSPacket(payload []byte, source M.Socksaddr, destination M.Socksaddr, writer N.PacketWriter)
 	N.TCPConnectionHandlerEx
 	N.UDPConnectionHandlerEx
-}
-
-type DirectRouteContext interface {
-	WritePacket(packet []byte) error
 }
 
 type Tun interface {
@@ -68,8 +60,15 @@ const (
 	DefaultIPRoute2AutoRedirectFallbackRuleIndex = 32768
 )
 
+const (
+	DNSModeDisabled = "disabled"
+	DNSModeNative   = "native"
+	DNSModeHijack   = "hijack"
+)
+
 type Options struct {
 	Name                                  string
+	NetNs                                 string
 	Inet4Address                          []netip.Prefix
 	Inet6Address                          []netip.Prefix
 	MTU                                   uint32
@@ -78,7 +77,8 @@ type Options struct {
 	InterfaceScope                        bool
 	Inet4Gateway                          netip.Addr
 	Inet6Gateway                          netip.Addr
-	DNSServers                            []netip.Addr
+	DNSMode                               string
+	DNSAddress                            []netip.Addr
 	IPRoute2TableIndex                    int
 	IPRoute2RuleIndex                     int
 	IPRoute2AutoRedirectFallbackRuleIndex int
@@ -102,6 +102,8 @@ type Options struct {
 	IncludeAndroidUser                    []int
 	IncludePackage                        []string
 	ExcludePackage                        []string
+	IncludeMACAddress                     []net.HardwareAddr
+	ExcludeMACAddress                     []net.HardwareAddr
 	InterfaceFinder                       control.InterfaceFinder
 	InterfaceMonitor                      DefaultInterfaceMonitor
 	FileDescriptor                        int
@@ -120,6 +122,57 @@ type Options struct {
 
 	// Will cause the darwin network to die, do not use.
 	EXP_SendMsgX bool
+}
+
+func (o *Options) DNSModeOrDefault() string {
+	if o.DNSMode == "" {
+		return DNSModeHijack
+	}
+	return o.DNSMode
+}
+
+func (o *Options) DNSServerAddress() ([]netip.Addr, error) {
+	inet4DNS, err := o.Inet4DNSAddress()
+	if err != nil {
+		return nil, err
+	}
+	inet6DNS, err := o.Inet6DNSAddress()
+	if err != nil {
+		return nil, err
+	}
+	return append(inet4DNS, inet6DNS...), nil
+}
+
+func (o *Options) Inet4DNSAddress() ([]netip.Addr, error) {
+	if len(o.Inet4Address) == 0 {
+		return nil, nil
+	}
+	if len(o.DNSAddress) > 0 {
+		return common.Filter(o.DNSAddress, netip.Addr.Is4), nil
+	}
+	if HasNextAddress(o.Inet4Address[0], 1) {
+		return []netip.Addr{o.Inet4Address[0].Addr().Next()}, nil
+	}
+	if !(len(o.Inet6Address) > 0 && HasNextAddress(o.Inet6Address[0], 1)) {
+		return nil, E.New("no IPv4 server configured and no usable next address in ", o.Inet6Address[0], " for DNS")
+	}
+	return nil, nil
+}
+
+func (o *Options) Inet6DNSAddress() ([]netip.Addr, error) {
+	if len(o.Inet6Address) == 0 {
+		return nil, nil
+	}
+	if len(o.DNSAddress) > 0 {
+		return common.Filter(o.DNSAddress, netip.Addr.Is6), nil
+	}
+	if HasNextAddress(o.Inet6Address[0], 1) {
+		return []netip.Addr{o.Inet6Address[0].Addr().Next()}, nil
+	}
+	if !(len(o.Inet4Address) > 0 && HasNextAddress(o.Inet4Address[0], 1)) {
+		return nil, E.New("no IPv6 server configured and no usable next address in ", o.Inet6Address[0], " for DNS")
+	}
+	return nil, nil
 }
 
 func (o *Options) Inet4GatewayAddr() netip.Addr {

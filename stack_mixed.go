@@ -12,16 +12,17 @@ import (
 	"github.com/sagernet/gvisor/pkg/tcpip/link/channel"
 	"github.com/sagernet/gvisor/pkg/tcpip/stack"
 	"github.com/sagernet/gvisor/pkg/tcpip/transport/udp"
-	"github.com/sagernet/sing-tun/internal/gtcpip/header"
+	"github.com/sagernet/sing-tun/gtcpip/header"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
 type Mixed struct {
 	*System
-	tun      GVisorTun
-	stack    *stack.Stack
-	endpoint *channel.Endpoint
+	tun          GVisorTun
+	stack        *stack.Stack
+	endpoint     *channel.Endpoint
+	udpForwarder *UDPForwarder
 }
 
 func NewMixed(
@@ -47,7 +48,13 @@ func (m *Mixed) Start() error {
 	if err != nil {
 		return err
 	}
-	ipStack.SetTransportProtocolHandler(udp.ProtocolNumber, NewUDPForwarder(m.ctx, ipStack, m.handler, m.udpTimeout).HandlePacket)
+	udpForwarder := NewUDPForwarder(m.ctx, ipStack, m.handler, m.udpNATOptions)
+	err = udpForwarder.Start()
+	if err != nil {
+		return err
+	}
+	ipStack.SetTransportProtocolHandler(udp.ProtocolNumber, udpForwarder.HandlePacket)
+	m.udpForwarder = udpForwarder
 	m.stack = ipStack
 	m.endpoint = endpoint
 	go m.tunLoop()
@@ -55,9 +62,19 @@ func (m *Mixed) Start() error {
 	return nil
 }
 
+func (m *Mixed) ResetNetwork() {
+	m.System.ResetNetwork()
+	if m.udpForwarder != nil {
+		m.udpForwarder.udpNat.Purge()
+	}
+}
+
 func (m *Mixed) Close() error {
 	if m.stack == nil {
 		return nil
+	}
+	if m.udpForwarder != nil {
+		m.udpForwarder.Close()
 	}
 	m.endpoint.Attach(nil)
 	m.stack.Close()
@@ -73,8 +90,6 @@ func (m *Mixed) tunLoop() {
 		return
 	}
 	if linuxTUN, isLinuxTUN := m.tun.(LinuxTUN); isLinuxTUN {
-		m.frontHeadroom = linuxTUN.FrontHeadroom()
-		m.txChecksumOffload = linuxTUN.TXChecksumOffload()
 		batchSize := linuxTUN.BatchSize()
 		if batchSize > 1 {
 			m.batchLoopLinux(linuxTUN, batchSize)
@@ -108,6 +123,7 @@ func (m *Mixed) tunLoop() {
 				m.logger.Trace(E.Cause(err, "write packet"))
 			}
 		}
+		m.dispatcher.Flush()
 	}
 }
 
@@ -132,6 +148,7 @@ func (m *Mixed) wintunLoop(winTun WinTun) {
 				m.logger.Trace(E.Cause(err, "write packet"))
 			}
 		}
+		m.dispatcher.Flush()
 		release()
 	}
 }
@@ -172,11 +189,13 @@ func (m *Mixed) batchLoopLinux(linuxTUN LinuxTUN, batchSize int) {
 			}
 			writeBuffers = writeBuffers[:0]
 		}
+		m.dispatcher.Flush()
 	}
 }
 
 func (m *Mixed) batchLoopDarwin(darwinTUN DarwinTUN) {
 	var writeBuffers []*buf.Buffer
+	var releaseBuffers []*buf.Buffer
 	for {
 		buffers, err := darwinTUN.BatchRead()
 		if err != nil {
@@ -189,6 +208,7 @@ func (m *Mixed) batchLoopDarwin(darwinTUN DarwinTUN) {
 			continue
 		}
 		writeBuffers = writeBuffers[:0]
+		releaseBuffers = releaseBuffers[:0]
 		for _, buffer := range buffers {
 			packetSize := buffer.Len()
 			if packetSize < header.IPv4MinimumSize {
@@ -198,7 +218,7 @@ func (m *Mixed) batchLoopDarwin(darwinTUN DarwinTUN) {
 			if m.processPacket(buffer.Bytes()) {
 				writeBuffers = append(writeBuffers, buffer)
 			} else {
-				buffer.Release()
+				releaseBuffers = append(releaseBuffers, buffer)
 			}
 		}
 		if len(writeBuffers) > 0 {
@@ -208,6 +228,8 @@ func (m *Mixed) batchLoopDarwin(darwinTUN DarwinTUN) {
 			}
 			buf.ReleaseMulti(writeBuffers)
 		}
+		m.dispatcher.Flush()
+		buf.ReleaseMulti(releaseBuffers)
 	}
 }
 
@@ -237,6 +259,9 @@ func (m *Mixed) processIPv4(ipHdr header.IPv4) (writeBack bool, err error) {
 	if destination == m.broadcastAddr || !destination.IsGlobalUnicast() {
 		return
 	}
+	if m.dispatchIPv4(ipHdr, destination) {
+		return false, nil
+	}
 	switch ipHdr.TransportProtocol() {
 	case header.TCPProtocolNumber:
 		writeBack, err = m.processIPv4TCP(ipHdr, ipHdr.Payload())
@@ -257,8 +282,12 @@ func (m *Mixed) processIPv4(ipHdr header.IPv4) (writeBack bool, err error) {
 
 func (m *Mixed) processIPv6(ipHdr header.IPv6) (writeBack bool, err error) {
 	writeBack = true
-	if !ipHdr.DestinationAddr().IsGlobalUnicast() {
+	destination := ipHdr.DestinationAddr()
+	if !destination.IsGlobalUnicast() {
 		return
+	}
+	if m.dispatchIPv6(ipHdr, destination) {
+		return false, nil
 	}
 	switch ipHdr.TransportProtocol() {
 	case header.TCPProtocolNumber:
