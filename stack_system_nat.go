@@ -100,13 +100,26 @@ func (n *TCPNat) LookupBack(port uint16) *TCPSession {
 	session := n.portMap[port]
 	n.portAccess.RUnlock()
 	if session != nil {
-		session.Lock()
-		if time.Since(session.LastActive) > time.Second {
-			session.LastActive = time.Now()
-		}
-		session.Unlock()
+		session.refresh()
 	}
 	return session
+}
+
+func (s *TCPSession) refresh() {
+	s.Lock()
+	if time.Since(s.LastActive) > time.Second {
+		s.LastActive = time.Now()
+	}
+	s.Unlock()
+}
+
+func (n *TCPNat) refresh(port uint16) {
+	n.portAccess.RLock()
+	session := n.portMap[port]
+	n.portAccess.RUnlock()
+	if session != nil {
+		session.refresh()
+	}
 }
 
 func (n *TCPNat) Lookup(source netip.AddrPort, destination netip.AddrPort) uint16 {
@@ -115,11 +128,14 @@ func (n *TCPNat) Lookup(source netip.AddrPort, destination netip.AddrPort) uint1
 	port, loaded := n.addrMap[key]
 	n.addrAccess.RUnlock()
 	if loaded {
+		n.refresh(port)
 		return port
 	}
 	n.addrAccess.Lock()
 	defer n.addrAccess.Unlock()
-	if port, loaded = n.addrMap[key]; loaded {
+	port, loaded = n.addrMap[key]
+	if loaded {
+		n.refresh(port)
 		return port
 	}
 	n.portAccess.Lock()
