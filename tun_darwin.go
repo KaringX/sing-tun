@@ -10,12 +10,9 @@ import (
 	"syscall"
 	"unsafe"
 
-	"github.com/sagernet/sing-tun/internal/gtcpip/header"
-	rawfile "github.com/sagernet/sing-tun/internal/rawfile_darwin"
-	stopfd "github.com/sagernet/sing-tun/internal/stopfd_darwin"
-
 	"github.com/sagernet/sing-tun/gtcpip/header"
 	rawfile "github.com/sagernet/sing-tun/internal/rawfile_darwin"
+	stopfd "github.com/sagernet/sing-tun/internal/stopfd_darwin"
 
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
