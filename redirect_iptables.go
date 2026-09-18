@@ -299,6 +299,7 @@ func (r *autoRedirect) iptablesAddExcludeRules(builder *iptablesBuilder, hook ip
 	}
 	if kind == iptablesKindNAT {
 		builder.add("-m", "connmark", "--mark", outputMark, "-j", "RETURN")
+		builder.add("-p", "tcp", "-m", "connmark", "--mark", iptablesMark(options.AutoRedirectInputMark, mask), "-j", "RETURN")
 	}
 	if hook == iptablesHookPrerouting {
 		builder.add("-i", options.Name, "-j", "RETURN")
@@ -353,28 +354,25 @@ func (r *autoRedirect) iptablesAddPreMatchRules(builder *iptablesBuilder, hook i
 	if hook == iptablesHookOutput {
 		if r.androidVPNService {
 			builder.add("!", "-o", options.Name, "-j", "RETURN")
-		} else {
-			builder.add("-o", options.Name, "-j", "RETURN")
 		}
 	} else {
 		builder.add("-i", "lo", "-j", "RETURN")
+		builder.add("-i", options.Name, "-j", "RETURN")
 	}
+	builder.add("-m", "conntrack", "--ctdir", "REPLY", "-j", "RETURN")
 	if builder.family.tproxy {
 		tproxyMark := iptablesMark(r.tunOptions.AutoRedirectTProxyMark, mask)
 		builder.add("-m", "connmark", "--mark", tproxyMark, "-j", "RETURN")
 		builder.add("-m", "mark", "--mark", tproxyMark, "-j", "CONNMARK", "--save-mark", "--nfmask", maskValue, "--ctmask", maskValue)
 		builder.add("-m", "mark", "--mark", tproxyMark, "-j", "RETURN")
 	}
-	builder.add("-m", "mark", "--mark", outputMark, "-j", "CONNMARK", "--save-mark", "--nfmask", maskValue, "--ctmask", maskValue)
-	builder.add("-m", "mark", "--mark", outputMark, "-j", "RETURN")
-	builder.add("-m", "mark", "--mark", inputMark, "-j", "CONNMARK", "--save-mark", "--nfmask", maskValue, "--ctmask", maskValue)
-	builder.add("-m", "mark", "--mark", inputMark, "-j", "RETURN")
-	builder.add("-p", "tcp", "-m", "mark", "--mark", resetMark, "-j", "RETURN")
-	if hook == iptablesHookOutput && r.androidVPNService {
-		builder.add("-m", "connmark", "--mark", outputMark, "-j", "MARK", "--set-xmark", outputMark)
+	for _, mark := range []string{outputMark, inputMark} {
+		builder.add("-m", "mark", "--mark", mark, "-j", "CONNMARK", "--save-mark", "--nfmask", maskValue, "--ctmask", maskValue)
+		builder.add("-m", "mark", "--mark", mark, "-j", "RETURN")
+		builder.add("-m", "connmark", "--mark", mark, "-j", "CONNMARK", "--restore-mark", "--nfmask", maskValue, "--ctmask", maskValue)
+		builder.add("-m", "connmark", "--mark", mark, "-j", "RETURN")
 	}
-	builder.add("-m", "connmark", "--mark", outputMark, "-j", "RETURN")
-	builder.add("-m", "connmark", "--mark", inputMark, "-j", "RETURN")
+	builder.add("-p", "tcp", "-m", "mark", "--mark", resetMark, "-j", "RETURN")
 	builder.add("-p", "tcp", "!", "--tcp-flags", "SYN,ACK", "SYN", "-j", "RETURN")
 	r.iptablesAddExcludeRules(builder, hook, iptablesKindFilter, dnsHijack)
 	queue := []string{"-j", "NFQUEUE", "--queue-num", strconv.Itoa(int(r.effectiveNFQueue())), "--queue-bypass"}

@@ -111,14 +111,14 @@ func New(options Options) (Tun, error) {
 			unix.Close(tunFd)
 			return nil, err
 		}
-		err = configure(tunFd, options.EXP_MultiPendingPackets, batchSize)
+		err = configure(tunFd, options.EXP_MultiPendingPackets, int(options.MTU))
 		if err != nil {
 			unix.Close(tunFd)
 			return nil, err
 		}
 	} else {
 		tunFd = options.FileDescriptor
-		err := configure(tunFd, options.EXP_MultiPendingPackets, batchSize)
+		err := configure(tunFd, options.EXP_MultiPendingPackets, int(options.MTU))
 		if err != nil {
 			return nil, err
 		}
@@ -341,19 +341,74 @@ func create(tunFd int, ifIndex int, name string, options Options) error {
 	return nil
 }
 
-func configure(tunFd int, multiPendingPackets bool, batchSize int) error {
+const (
+	utunReceiveBufferTarget  = 8 << 20
+	utunReceiveBufferMinimum = 1 << 20
+	utunReceiveBufferDefault = 512 << 10
+	utunMaxPendingPackets    = 64
+)
+
+func configure(tunFd int, multiPendingPackets bool, mtu int) error {
 	err := unix.SetNonblock(tunFd, true)
 	if err != nil {
 		return os.NewSyscallError("SetNonblock", err)
 	}
-	if multiPendingPackets {
-		const UTUN_OPT_MAX_PENDING_PACKETS = 16
-		err = unix.SetsockoptInt(tunFd, 2, UTUN_OPT_MAX_PENDING_PACKETS, batchSize)
-		if err != nil {
-			return os.NewSyscallError("SetsockoptInt UTUN_OPT_MAX_PENDING_PACKETS", err)
-		}
+	if !multiPendingPackets {
+		return nil
+	}
+	// The utun control socket drops outbound packets with ENOBUFS once the queued bytes reach
+	// SO_RCVBUF (kern_control.c ctl_rcvbspace; sbspace counts bytes only for SB_KCTL, default
+	// 512 KB), whereas reaching UTUN_OPT_MAX_PENDING_PACKETS pauses the interface until the
+	// socket is read (if_utun.c utun_start / utun_ctl_rcvd). SO_RCVBUF is clamped to
+	// kern.ipc.maxsockbuf by sbreserve.
+	receiveBuffer := raiseReceiveBuffer(tunFd)
+	pending := receiveBuffer / 8 * 7 / (mtu + PacketOffset)
+	pending = max(min(pending, utunMaxPendingPackets), 1)
+	const UTUN_OPT_MAX_PENDING_PACKETS = 16
+	err = unix.SetsockoptInt(tunFd, 2, UTUN_OPT_MAX_PENDING_PACKETS, pending)
+	if err != nil {
+		return os.NewSyscallError("SetsockoptInt UTUN_OPT_MAX_PENDING_PACKETS", err)
 	}
 	return nil
+}
+
+func raiseReceiveBuffer(tunFd int) int {
+	for size := utunReceiveBufferTarget; size >= utunReceiveBufferMinimum; size /= 2 {
+		err := unix.SetsockoptInt(tunFd, unix.SOL_SOCKET, unix.SO_RCVBUF, size)
+		if err == nil {
+			break
+		}
+	}
+	current, err := unix.GetsockoptInt(tunFd, unix.SOL_SOCKET, unix.SO_RCVBUF)
+	if err != nil || current <= 0 {
+		return utunReceiveBufferDefault
+	}
+	return current
+}
+
+func (t *NativeTun) rawFileDescriptor() int {
+	return t.tunFd
+}
+
+// os.NewFile registers a non-blocking descriptor with the runtime poller, which then wakes an
+// idle thread for every packet the engine loop is already waiting for on its own kqueue.
+func (t *NativeTun) detachRuntimePoller() error {
+	duplicated, err := unix.FcntlInt(uintptr(t.tunFd), unix.F_DUPFD_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	previous := t.tunFile
+	t.tunFd = duplicated
+	t.tunFile = newUnpolledFile(duplicated, "utun")
+	return previous.Close()
+}
+
+func (t *NativeTun) transmitAccess() *sync.Mutex {
+	return &t.writeAccess
+}
+
+func (t *NativeTun) enableMaxPendingPackets() error {
+	return configure(t.tunFd, true, int(t.options.MTU))
 }
 
 func (t *NativeTun) BatchRead() ([]*buf.Buffer, error) {
