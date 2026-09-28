@@ -101,17 +101,24 @@ func (m *Mixed) tunLoop() {
 		return
 	}
 	packetBuffer := make([]byte, m.mtu+PacketOffset)
+	var readRetry ReadRetry
 	for {
 		if m.close.Load() == 1 { //karing
 			return
 		}
 		n, err := m.tun.Read(packetBuffer)
 		if err != nil {
-			if E.IsClosed(err) {
-				return
+			if IsRecoverableReadError(err) {
+				m.logger.Debug(E.Cause(err, "read packet"))
+				readRetry.Wait(err)
+				continue
 			}
-			m.logger.Error(E.Cause(err, "read packet"))
+			if !E.IsClosed(err) {
+				m.logger.Error(E.Cause(err, "read packet"))
+			}
+			return
 		}
+		readRetry.Reset()
 		if n < header.IPv4MinimumSize {
 			continue
 		}
@@ -160,13 +167,20 @@ func (m *Mixed) batchLoopLinux(linuxTUN LinuxTUN, batchSize int) {
 	for i := range packetBuffers {
 		packetBuffers[i] = make([]byte, m.mtu+PacketOffset+m.frontHeadroom)
 	}
+	var readRetry ReadRetry
 	for {
 		n, err := linuxTUN.BatchRead(packetBuffers, m.frontHeadroom, packetSizes)
 		if err != nil {
-			if E.IsClosed(err) {
+			if !IsRecoverableReadError(err) {
+				if !E.IsClosed(err) {
+					m.logger.Error(E.Cause(err, "batch read packet"))
+				}
 				return
 			}
-			m.logger.Error(E.Cause(err, "batch read packet"))
+			m.logger.Debug(E.Cause(err, "batch read packet"))
+			readRetry.Wait(err)
+		} else {
+			readRetry.Reset()
 		}
 		if n == 0 {
 			continue
@@ -196,13 +210,20 @@ func (m *Mixed) batchLoopLinux(linuxTUN LinuxTUN, batchSize int) {
 func (m *Mixed) batchLoopDarwin(darwinTUN DarwinTUN) {
 	var writeBuffers []*buf.Buffer
 	var releaseBuffers []*buf.Buffer
+	var readRetry ReadRetry
 	for {
 		buffers, err := darwinTUN.BatchRead()
 		if err != nil {
-			if E.IsClosed(err) || errors.Is(err, syscall.EBADF) {
+			if !IsRecoverableReadError(err) {
+				if !E.IsClosed(err) && !errors.Is(err, syscall.EBADF) {
+					m.logger.Error(E.Cause(err, "batch read packet"))
+				}
 				return
 			}
-			m.logger.Error(E.Cause(err, "batch read packet"))
+			m.logger.Debug(E.Cause(err, "batch read packet"))
+			readRetry.Wait(err)
+		} else {
+			readRetry.Reset()
 		}
 		if len(buffers) == 0 {
 			continue

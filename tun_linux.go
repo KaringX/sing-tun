@@ -823,6 +823,7 @@ func (t *NativeTun) rules() []*netlink.Rule {
 	}
 	if len(t.options.IncludeInterface) > 0 {
 		matchPriority := priority + 2
+		matchPriority6 := priority6 + 2
 		for _, includeInterface := range t.options.IncludeInterface {
 			if p4 {
 				it = netlink.NewRule()
@@ -836,7 +837,7 @@ func (t *NativeTun) rules() []*netlink.Rule {
 				it = netlink.NewRule()
 				it.Priority = priority6
 				it.IifName = includeInterface
-				it.Goto = matchPriority
+				it.Goto = matchPriority6
 				it.Family = unix.AF_INET6
 				rules = append(rules, it)
 			}
@@ -870,7 +871,7 @@ func (t *NativeTun) rules() []*netlink.Rule {
 			priority6++
 
 			it = netlink.NewRule()
-			it.Priority = matchPriority
+			it.Priority = matchPriority6
 			it.Family = unix.AF_INET6
 			rules = append(rules, it)
 			priority6++
@@ -1039,6 +1040,17 @@ func (t *NativeTun) rules() []*netlink.Rule {
 		// priority++
 	}
 	if p6 {
+		for _, address := range t.options.Inet6Address {
+			it = netlink.NewRule()
+			it.Priority = priority6
+			it.IifName = "lo"
+			it.Src = address.Masked()
+			it.Table = t.options.IPRoute2TableIndex
+			it.Family = unix.AF_INET6
+			rules = append(rules, it)
+		}
+		priority6++
+
 		it = netlink.NewRule()
 		it.Priority = priority6
 		it.IifName = t.options.Name
@@ -1061,17 +1073,6 @@ func (t *NativeTun) rules() []*netlink.Rule {
 		it.Goto = nopPriority
 		it.Family = unix.AF_INET6
 		rules = append(rules, it)
-		priority6++
-
-		for _, address := range t.options.Inet6Address {
-			it = netlink.NewRule()
-			it.Priority = priority6
-			it.IifName = "lo"
-			it.Src = address.Masked()
-			it.Table = t.options.IPRoute2TableIndex
-			it.Family = unix.AF_INET6
-			rules = append(rules, it)
-		}
 		priority6++
 
 		it = netlink.NewRule()
