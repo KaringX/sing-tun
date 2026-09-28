@@ -50,7 +50,7 @@ type LinuxTUN interface {
 
 type DarwinTUN interface {
 	Tun
-	BatchRead() ([]*buf.Buffer, error)
+	BatchRead(frontHeadroom int, rearHeadroom int) ([]*buf.Buffer, error)
 	BatchWrite(buffers []*buf.Buffer) error
 }
 
@@ -99,6 +99,7 @@ type Options struct {
 	Inet6RouteExcludeAddress              []netip.Prefix
 	IncludeInterface                      []string
 	ExcludeInterface                      []string
+	BridgeInterface                       []string
 	IncludeUID                            []ranges.Range[uint32]
 	ExcludeUID                            []ranges.Range[uint32]
 	IncludeAndroidUser                    []int
