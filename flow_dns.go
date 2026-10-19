@@ -1,6 +1,7 @@
 package tun
 
 import (
+	"math"
 	"net/netip"
 
 	"github.com/sagernet/sing-tun/gtcpip/checksum"
@@ -42,6 +43,9 @@ func (w *dnsResponseWriter) WritePacket(buffer *buf.Buffer, destination M.Socksa
 			return E.New("send IPv6 packet to IPv4 connection")
 		}
 		size := header.IPv4MinimumSize + udpLen
+		if size > math.MaxUint16 {
+			return E.New("DNS response too large: ", buffer.Len())
+		}
 		packet = make([]byte, headroom+size)
 		inet4Hdr := header.IPv4(packet[headroom:])
 		inet4Hdr.Encode(&header.IPv4Fields{
@@ -56,6 +60,9 @@ func (w *dnsResponseWriter) WritePacket(buffer *buf.Buffer, destination M.Socksa
 	} else {
 		if destinationAddr.Is4() {
 			destinationAddr = netip.AddrFrom16(destinationAddr.As16())
+		}
+		if udpLen > math.MaxUint16 {
+			return E.New("DNS response too large: ", buffer.Len())
 		}
 		size := header.IPv6MinimumSize + udpLen
 		packet = make([]byte, headroom+size)
@@ -76,9 +83,13 @@ func (w *dnsResponseWriter) WritePacket(buffer *buf.Buffer, destination M.Socksa
 		Length:  uint16(udpLen),
 	})
 	copy(udpHdr.Payload(), buffer.Bytes())
-	udpHdr.SetChecksum(^checksum.Checksum(udpHdr.Payload(), udpHdr.CalculateChecksum(
+	udpChecksum := ^checksum.Checksum(udpHdr.Payload(), udpHdr.CalculateChecksum(
 		header.PseudoHeaderChecksum(header.UDPProtocolNumber, ipHdr.SourceAddressSlice(), ipHdr.DestinationAddressSlice(), uint16(udpLen)),
-	)))
+	))
+	if udpChecksum == 0 {
+		udpChecksum = 0xffff
+	}
+	udpHdr.SetChecksum(udpChecksum)
 	if inet4Hdr, isInet4 := ipHdr.(header.IPv4); isInet4 {
 		inet4Hdr.SetChecksum(^inet4Hdr.CalculateChecksum())
 	}

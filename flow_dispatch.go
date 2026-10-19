@@ -58,7 +58,11 @@ func (m *ForwardFrameMeta) completeChecksum(raw []byte) {
 	}
 	initial := binary.BigEndian.Uint16(raw[checksumAt:])
 	raw[checksumAt], raw[checksumAt+1] = 0, 0
-	binary.BigEndian.PutUint16(raw[checksumAt:], ^checksum.Checksum(raw[m.checksumStart:], initial))
+	transportChecksum := ^checksum.Checksum(raw[m.checksumStart:], initial)
+	if transportChecksum == 0 {
+		transportChecksum = 0xffff
+	}
+	binary.BigEndian.PutUint16(raw[checksumAt:], transportChecksum)
 }
 
 type flowEntry struct {
@@ -71,6 +75,8 @@ type flowEntry struct {
 
 type forwardFlow struct {
 	nat          *portNAT
+	mapping      *natMapping
+	selectorKey  natSelectorKey
 	owner        *ForwardStage
 	reverseKey   flowKey
 	forwardRule  rewriteRule
@@ -136,18 +142,18 @@ func (f *forwardFlow) observeReverse(packet *forwardPacket, now int64) {
 }
 
 type ForwardDispatcher struct {
-	epoch       time.Time
-	handler     Handler
-	writeback   ForwardWriteback
-	logger      logger.Logger
-	udpTimeout  time.Duration
-	icmpTimeout time.Duration
+	epoch        time.Time
+	handler      Handler
+	writeback    ForwardWriteback
+	logger       logger.Logger
+	udpTimeout   time.Duration
+	udpMapping   NATMapping
+	udpFiltering NATFiltering
+	icmpTimeout  time.Duration
 
+	closed          atomic.Bool
 	portsAccess     sync.Mutex
-	ports           map[Port]*portNAT
-	natList         atomic.Pointer[[]*portNAT]
-	revNAT          atomic.Pointer[map[netip.Addr]*portNAT]
-	returnPath      forwardReturn
+	ports           map[Port]*portReturn
 	stagesAccess    sync.Mutex
 	stages          []*ForwardStage
 	stageCount      atomic.Int32
@@ -182,15 +188,17 @@ func addrToTCPIP(addr netip.Addr) tcpip.Address {
 	return tcpip.AddrFrom16(addr.As16())
 }
 
-func NewForwardDispatcher(handler Handler, writeback ForwardWriteback, logger logger.Logger, udpTimeout time.Duration, icmpTimeout time.Duration) *ForwardDispatcher {
+func NewForwardDispatcher(handler Handler, writeback ForwardWriteback, logger logger.Logger, udpOptions UDPNatOptions, icmpTimeout time.Duration) *ForwardDispatcher {
 	dispatcher := &ForwardDispatcher{
-		epoch:       time.Now(),
-		handler:     handler,
-		writeback:   writeback,
-		logger:      logger,
-		udpTimeout:  udpTimeout,
-		icmpTimeout: icmpTimeout,
-		ports:       make(map[Port]*portNAT),
+		epoch:        time.Now(),
+		handler:      handler,
+		writeback:    writeback,
+		logger:       logger,
+		udpTimeout:   udpOptions.Timeout,
+		udpMapping:   udpOptions.Mapping,
+		udpFiltering: udpOptions.Filtering,
+		icmpTimeout:  icmpTimeout,
+		ports:        make(map[Port]*portReturn),
 	}
 	if dispatcher.udpTimeout <= 0 {
 		dispatcher.udpTimeout = defaultUDPTimeout
@@ -198,7 +206,6 @@ func NewForwardDispatcher(handler Handler, writeback ForwardWriteback, logger lo
 	if dispatcher.icmpTimeout <= 0 {
 		dispatcher.icmpTimeout = defaultICMPTimeout
 	}
-	dispatcher.returnPath.dispatcher = dispatcher
 	return dispatcher
 }
 
@@ -230,7 +237,7 @@ func (d *ForwardDispatcher) Close() {
 	if d == nil {
 		return
 	}
-	d.returnPath.closed.Store(true)
+	d.closed.Store(true)
 	d.stagesAccess.Lock()
 	stages := d.stages
 	d.stagesAccess.Unlock()
@@ -242,18 +249,16 @@ func (d *ForwardDispatcher) Close() {
 		stage.access.Unlock()
 	}
 	d.portsAccess.Lock()
-	ports := make([]Port, 0, len(d.ports))
-	for port := range d.ports {
-		ports = append(ports, port)
-	}
+	returnPaths := slices.Collect(maps.Values(d.ports))
 	d.portsAccess.Unlock()
-	for _, port := range ports {
-		port.DetachReturn(&d.returnPath)
+	for _, returnPath := range returnPaths {
+		returnPath.nat.port.DetachReturn(returnPath)
+		releasePortNAT(returnPath.nat)
 	}
 }
 
 func (s *ForwardStage) Dispatch(packet []byte) bool {
-	if s == nil || s.dispatcher.returnPath.closed.Load() {
+	if s == nil || s.dispatcher.closed.Load() {
 		return false
 	}
 	parsed, ok := parseForwardPacket(packet)
@@ -264,7 +269,7 @@ func (s *ForwardStage) Dispatch(packet []byte) bool {
 }
 
 func (s *ForwardStage) DispatchParsed(packet []byte, meta ForwardFrameMeta, parsed *forwardPacket) bool {
-	if s == nil || s.dispatcher.returnPath.closed.Load() {
+	if s == nil || s.dispatcher.closed.Load() {
 		return false
 	}
 	return s.dispatch(packet, parsed, &meta)
@@ -299,7 +304,7 @@ func (s *ForwardStage) dispatch(packet []byte, parsed *forwardPacket, meta *Forw
 }
 
 func (s *ForwardStage) teardownFlow(key flowKey, reason FlowCloseReason) {
-	if s == nil || s.dispatcher.returnPath.closed.Load() {
+	if s == nil || s.dispatcher.closed.Load() {
 		return
 	}
 	s.access.Lock()
@@ -374,7 +379,7 @@ func (s *ForwardStage) judgeAndInstall(key flowKey, packet *forwardPacket, raw [
 	}
 	s.access.Lock()
 	defer s.access.Unlock()
-	if d.returnPath.closed.Load() {
+	if d.closed.Load() {
 		return false
 	}
 	now := d.now()
@@ -505,6 +510,9 @@ func (s *ForwardStage) createFlow(packet *forwardPacket, verdict FlowVerdict) (*
 	serverPort := clientDestinationPort
 	if verdict.Destination.Addr().IsValid() {
 		serverAddress = verdict.Destination.Addr()
+		if serverAddress.Is4() != clientDestinationAddress.Is4() {
+			return nil, createFlowUnsupported
+		}
 	}
 	if verdict.Destination.Port() != 0 && !isICMP {
 		serverPort = verdict.Destination.Port()
@@ -513,9 +521,16 @@ func (s *ForwardStage) createFlow(packet *forwardPacket, verdict FlowVerdict) (*
 	if nat == nil {
 		return nil, createFlowUnsupported
 	}
-	selector, reverseKey, allocated := nat.reserveSelector(packet.protocol, portAddress, serverAddress, serverPort, packet.source.Port())
-	if !allocated {
-		return nil, createFlowExhausted
+	server := netip.AddrPortFrom(serverAddress, serverPort)
+	reservation, reserved := nat.reserve(s.dispatcher, packet.protocol, portAddress, packet.source, server)
+	if !reserved {
+		rangedPort, isRanged := portCapability[PortWithSelectorRange](verdict.Port)
+		if isRanged && rangedPort.ExpandSelectorRanges(packet.protocol) {
+			reservation, reserved = nat.reserve(s.dispatcher, packet.protocol, portAddress, packet.source, server)
+		}
+		if !reserved {
+			return nil, createFlowExhausted
+		}
 	}
 	var udpTimeout time.Duration
 	if packet.protocol == uint8(header.UDPProtocolNumber) {
@@ -524,7 +539,6 @@ func (s *ForwardStage) createFlow(packet *forwardPacket, verdict FlowVerdict) (*
 	flow := &forwardFlow{
 		nat:                      nat,
 		owner:                    s,
-		reverseKey:               reverseKey,
 		effectiveMTU:             effectiveMTU,
 		protocol:                 packet.protocol,
 		udpTimeout:               udpTimeout,
@@ -538,7 +552,6 @@ func (s *ForwardStage) createFlow(packet *forwardPacket, verdict FlowVerdict) (*
 	}
 	flow.forwardRule = rewriteRule{
 		sourceAddress:     addrToTCPIP(portAddress),
-		sourcePort:        selector,
 		rewriteSourcePort: true,
 	}
 	if flow.dnatAddress {
@@ -566,44 +579,30 @@ func (s *ForwardStage) createFlow(packet *forwardPacket, verdict FlowVerdict) (*
 			flow.tracker.AttachFlow(flow)
 		}
 	}
-	nat.insert(reverseKey, flow)
+	nat.publish(flow, reservation)
 	return flow, createFlowOK
 }
 
 func (d *ForwardDispatcher) natFor(port Port) *portNAT {
 	d.portsAccess.Lock()
 	defer d.portsAccess.Unlock()
-	nat, loaded := d.ports[port]
+	returnPath, loaded := d.ports[port]
 	if loaded {
-		return nat
+		return returnPath.nat
 	}
-	err := port.AttachReturn(&d.returnPath)
+	returnPath = &portReturn{
+		dispatcher: d,
+		nat:        acquirePortNAT(port),
+		fragments:  fragmentTable{entries: make(map[fragmentKey]*fragmentEntry)},
+	}
+	err := port.AttachReturn(returnPath)
 	if err != nil {
+		releasePortNAT(returnPath.nat)
 		d.logger.Trace(E.Cause(err, "attach return path"))
 		return nil
 	}
-	nat = newPortNAT(port)
-	d.ports[port] = nat
-	var natList []*portNAT
-	current := d.natList.Load()
-	if current != nil {
-		natList = append(natList, *current...)
-	}
-	natList = append(natList, nat)
-	d.natList.Store(&natList)
-	revMap := make(map[netip.Addr]*portNAT)
-	if currentRev := d.revNAT.Load(); currentRev != nil {
-		maps.Copy(revMap, *currentRev)
-	}
-	v4Address, v6Address := port.PortAddresses()
-	if v4Address.IsValid() {
-		revMap[v4Address] = nat
-	}
-	if v6Address.IsValid() {
-		revMap[v6Address] = nat
-	}
-	d.revNAT.Store(&revMap)
-	return nat
+	d.ports[port] = returnPath
+	return returnPath.nat
 }
 
 func (s *ForwardStage) forwardToPort(flow *forwardFlow, packet *forwardPacket, raw []byte, meta *ForwardFrameMeta) {
@@ -704,7 +703,7 @@ func (s *ForwardStage) Flush() {
 		return
 	}
 	d := s.dispatcher
-	if d.returnPath.closed.Load() {
+	if d.closed.Load() {
 		return
 	}
 	now := d.now()
@@ -792,7 +791,7 @@ func (s *ForwardStage) removeEntry(key flowKey, entry *flowEntry, reason FlowClo
 			reason = FlowCloseFinished
 		}
 		entry.flow.close(reason)
-		entry.flow.nat.delete(entry.flow.reverseKey)
+		entry.flow.nat.release(entry.flow)
 	}
 }
 
@@ -847,12 +846,13 @@ func isICMPProtocol(protocol uint8) bool {
 	return protocol == uint8(header.ICMPv4ProtocolNumber) || protocol == uint8(header.ICMPv6ProtocolNumber)
 }
 
-type forwardReturn struct {
+type portReturn struct {
 	dispatcher *ForwardDispatcher
-	closed     atomic.Bool
+	nat        *portNAT
+	fragments  fragmentTable
 }
 
-func (r *forwardReturn) ReturnHeadroom() int {
+func (r *portReturn) ReturnHeadroom() int {
 	return r.dispatcher.writeback.ReturnHeadroom()
 }
 
@@ -869,25 +869,16 @@ type returnBatch struct {
 	packets   [][]byte
 }
 
-func (r *forwardReturn) ReturnPackets(packets [][]byte) [][]byte {
-	if r.closed.Load() {
+func (r *portReturn) ReturnPackets(packets [][]byte) [][]byte {
+	if r.dispatcher.closed.Load() {
 		return packets
-	}
-	natListPtr := r.dispatcher.natList.Load()
-	if natListPtr == nil {
-		return packets
-	}
-	natList := *natListPtr
-	var revMap map[netip.Addr]*portNAT
-	if revPtr := r.dispatcher.revNAT.Load(); revPtr != nil {
-		revMap = *revPtr
 	}
 	headroom := r.dispatcher.writeback.ReturnHeadroom()
 	now := r.dispatcher.now()
 	unconsumed := packets[:0]
 	var batches []returnBatch
 	for _, raw := range packets {
-		decision, writeback := r.classifyReturn(raw, natList, revMap, headroom, now)
+		decision, writeback := r.classifyReturn(raw, headroom, now)
 		switch decision {
 		case returnWrite:
 			index := slices.IndexFunc(batches, func(batch returnBatch) bool { return batch.writeback == writeback })
@@ -910,24 +901,27 @@ func (r *forwardReturn) ReturnPackets(packets [][]byte) [][]byte {
 	return unconsumed
 }
 
-func (r *forwardReturn) classifyReturn(raw []byte, natList []*portNAT, revMap map[netip.Addr]*portNAT, headroom int, now int64) (returnDecision, ForwardWriteback) {
+func (r *portReturn) classifyReturn(raw []byte, headroom int, now int64) (returnDecision, ForwardWriteback) {
 	if len(raw) < headroom+header.IPv4MinimumSize {
 		return returnPass, nil
 	}
 	parsed, ok := parseForwardPacket(raw[headroom:])
-	if !ok || parsed.fragment {
+	if !ok {
 		return returnPass, nil
+	}
+	if parsed.fragment {
+		return r.classifyFragment(&parsed, len(raw)-headroom, now)
 	}
 	if !parsed.hasFlow {
 		if parsed.isICMPError() {
-			flow := returnICMPError(natList, revMap, &parsed)
+			flow := r.returnICMPError(&parsed)
 			if flow != nil {
 				return returnWrite, flow.owner.writeback
 			}
 		}
 		return returnPass, nil
 	}
-	flow := findReverseFlow(natList, revMap, parsed.flowKey())
+	flow, rule := r.matchReverse(&parsed)
 	if flow == nil {
 		return returnPass, nil
 	}
@@ -939,30 +933,35 @@ func (r *forwardReturn) classifyReturn(raw []byte, natList []*portNAT, revMap ma
 	}
 	flow.observeReverse(&parsed, now)
 	if parsed.isTCPSyn() {
-		applyRewriteRaw(&parsed, &flow.reverseRule)
+		applyRewriteRaw(&parsed, rule)
 		clampTCPMSS(&parsed, flow.effectiveMTU)
 		recomputeChecksums(&parsed)
 	} else {
-		applyRewrite(&parsed, &flow.reverseRule)
+		applyRewrite(&parsed, rule)
 	}
 	return returnWrite, flow.owner.writeback
 }
 
-func findReverseFlow(natList []*portNAT, revMap map[netip.Addr]*portNAT, key flowKey) *forwardFlow {
-	if nat, ok := revMap[key.destination.Addr()]; ok {
-		if flow := nat.lookup(key); flow != nil {
-			return flow
+func (r *portReturn) matchReverse(parsed *forwardPacket) (*forwardFlow, *rewriteRule) {
+	key := parsed.flowKey()
+	flow := r.nat.lookup(key)
+	if flow != nil {
+		if flow.owner.dispatcher != r.dispatcher {
+			return nil, nil
 		}
+		return flow, &flow.reverseRule
 	}
-	for _, nat := range natList {
-		if flow := nat.lookup(key); flow != nil {
-			return flow
-		}
+	if parsed.protocol != uint8(header.UDPProtocolNumber) {
+		return nil, nil
 	}
-	return nil
+	mapping, anchor := r.nat.lookupMapping(key.destination.Addr(), key.destination.Port(), key.source.Addr())
+	if mapping == nil || mapping.key.dispatcher != r.dispatcher {
+		return nil, nil
+	}
+	return anchor, &mapping.reverseRule
 }
 
-func returnICMPError(natList []*portNAT, revMap map[netip.Addr]*portNAT, parsed *forwardPacket) *forwardFlow {
+func (r *portReturn) returnICMPError(parsed *forwardPacket) *forwardFlow {
 	inner, ok := parsed.icmpErrorInner()
 	if !ok {
 		return nil
@@ -971,18 +970,18 @@ func returnICMPError(natList []*portNAT, revMap map[netip.Addr]*portNAT, parsed 
 	if !parsedInner {
 		return nil
 	}
-	flow := findReverseFlow(natList, revMap, embedded.flowKey().reversed())
-	if flow == nil || flow.closed.Load() {
+	flow := r.nat.lookup(embedded.flowKey().reversed())
+	if flow == nil || flow.owner.dispatcher != r.dispatcher || flow.closed.Load() {
 		return nil
 	}
 	rewriteEmbeddedSource(&embedded, addrToTCPIP(flow.clientAddress), flow.clientSelector, true)
 	if flow.dnatAddress || flow.dnatPort {
 		rewriteEmbeddedDestination(&embedded, addrToTCPIP(flow.clientDestinationAddress), flow.clientDestinationPort, flow.dnatPort)
 	}
-	networkHeader := parsed.networkHeader()
-	networkHeader.SetDestinationAddr(flow.clientAddress)
-	if networkHeader.SourceAddr() == flow.serverAddress {
-		networkHeader.SetSourceAddr(flow.clientDestinationAddress)
+	sourceAddress, destinationAddress := parsed.addressSlices()
+	copy(destinationAddress, flow.clientAddress.AsSlice())
+	if parsed.source.Addr() == flow.serverAddress {
+		copy(sourceAddress, flow.clientDestinationAddress.AsSlice())
 	}
 	recomputeChecksums(parsed)
 	return flow
