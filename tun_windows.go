@@ -93,7 +93,7 @@ func (t *NativeTun) configure() error {
 		if err != nil {
 			return E.Cause(err, "set ipv4 address")
 		}
-		if t.options.AutoRoute && t.options.DNSModeOrDefault() != DNSModeDisabled {
+		if t.options.DNSModeOrDefault() != DNSModeDisabled {
 			dnsServers, err := t.options.Inet4DNSAddress()
 			if err != nil {
 				return err
@@ -114,7 +114,7 @@ func (t *NativeTun) configure() error {
 		if err != nil {
 			return E.Cause(err, "set ipv6 address")
 		}
-		if t.options.AutoRoute && t.options.DNSModeOrDefault() != DNSModeDisabled {
+		if t.options.DNSModeOrDefault() != DNSModeDisabled {
 			dnsServers, err := t.options.Inet6DNSAddress()
 			if err != nil {
 				return err
