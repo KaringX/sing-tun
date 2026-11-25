@@ -32,6 +32,7 @@ type Tun interface {
 	Start() error
 	Close() error
 	UpdateRouteOptions(tunOptions Options) error
+	GetOptions() Options //karing
 }
 
 type WinTun interface {
